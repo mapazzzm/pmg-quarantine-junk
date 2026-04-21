@@ -60,6 +60,7 @@ _BASE = """\
     h1 {{ margin: 0 0 12px; font-size: 22px; color: {color}; }}
     p  {{ color: #555; font-size: 15px; line-height: 1.6; margin: 0; }}
     .detail {{ margin-top: 24px; font-size: 12px; color: #bbb; }}
+    .autoclose {{ margin-top: 20px; font-size: 13px; color: #aaa; }}
   </style>
 </head>
 <body>
@@ -68,13 +69,36 @@ _BASE = """\
     <h1>{title}</h1>
     <p>{message}</p>
     {detail}
+    {autoclose}
   </div>
+  {script}
 </body>
 </html>
 """
 
 
+_AUTOCLOSE_DELAY = 4  # секунды до закрытия вкладки
+
+_AUTOCLOSE_BLOCK = """\
+<p class="autoclose">Вкладка закроется автоматически через <span id="cd">{delay}</span> сек.</p>"""
+
+_AUTOCLOSE_SCRIPT = """\
+<script>
+(function() {{
+  var n = {delay};
+  var el = document.getElementById('cd');
+  var t = setInterval(function() {{
+    n--;
+    if (el) el.textContent = n;
+    if (n <= 0) {{ clearInterval(t); window.close(); }}
+  }}, 1000);
+}})();
+</script>"""
+
+
 def page_ok(action: str, quarantine_id: str) -> str:
+    autoclose = _AUTOCLOSE_BLOCK.format(delay=_AUTOCLOSE_DELAY)
+    script    = _AUTOCLOSE_SCRIPT.format(delay=_AUTOCLOSE_DELAY)
     if action == 'whitelist':
         return _BASE.format(
             icon='&#9989;',
@@ -84,6 +108,8 @@ def page_ok(action: str, quarantine_id: str) -> str:
                     'Отправитель добавлен в белый список — следующие письма '
                     'от него будут доставляться автоматически.',
             detail=f'<p class="detail">ID: {html.escape(quarantine_id)}</p>',
+            autoclose=autoclose,
+            script=script,
         )
     else:
         return _BASE.format(
@@ -94,6 +120,8 @@ def page_ok(action: str, quarantine_id: str) -> str:
                     'Отправитель добавлен в чёрный список — его будущие письма '
                     'будут автоматически отклоняться.',
             detail=f'<p class="detail">ID: {html.escape(quarantine_id)}</p>',
+            autoclose=autoclose,
+            script=script,
         )
 
 
@@ -104,6 +132,8 @@ def page_error(reason: str) -> str:
         color='#e74c3c',
         message=html.escape(reason),
         detail='',
+        autoclose='',
+        script='',
     )
 
 
@@ -115,6 +145,8 @@ def page_already_done() -> str:
         message='Это письмо уже было обработано ранее (через эту ссылку '
                 'или в интерфейсе карантина PMG).',
         detail='',
+        autoclose='',
+        script='',
     )
 
 
@@ -126,6 +158,8 @@ def page_expired() -> str:
         message='Срок действия ссылки истёк. Войдите в карантин PMG '
                 'для управления этим письмом.',
         detail='',
+        autoclose='',
+        script='',
     )
 
 

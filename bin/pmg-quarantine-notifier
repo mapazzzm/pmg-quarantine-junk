@@ -214,16 +214,20 @@ def _sanitize_html(raw_html: str) -> str:
     return p.get_output()
 
 
-def _apply_body_percent(html_body: str, text_body: str, percent: int) -> tuple:
+def _apply_body_percent(html_body: str, text_body: str,
+                        percent: int, min_chars: int = 1000) -> tuple:
     """
     Обрезает тело письма до заданного процента.
-    Для HTML — обрезает по символам с добавлением предупреждения.
-    Для plain text — аналогично.
+    Если объём текста не превышает min_chars символов — показывает целиком.
     Возвращает (html_body, text_body).
     """
     if percent <= 0:
         return '', ''
     if percent >= 100:
+        return html_body, text_body
+
+    # Короткое письмо — показываем целиком
+    if len(html_body) <= min_chars and len(text_body) <= min_chars:
         return html_body, text_body
 
     def _truncate(text: str, pct: int) -> tuple[str, bool]:
@@ -607,18 +611,19 @@ def build_notification(row: dict, mail_info: dict,
     """Собирает MIME-письмо уведомления."""
 
 
-    ttl_days     = cfg.getint('tokens', 'ttl_days', fallback=7)
-    mail_from    = cfg.get('notifications', 'mail_from',
-                           fallback='Proxmox Mail Gateway <postmaster@localhost>')
-    body_percent = cfg.getint('notifications', 'body_percent', fallback=100)
+    ttl_days      = cfg.getint('tokens', 'ttl_days', fallback=7)
+    mail_from     = cfg.get('notifications', 'mail_from',
+                            fallback='Proxmox Mail Gateway <postmaster@localhost>')
+    body_percent  = cfg.getint('notifications', 'body_percent',  fallback=100)
+    body_min_chars = cfg.getint('notifications', 'body_min_chars', fallback=1000)
 
     attachments    = mail_info.get('attachments', [])
     body_html_safe = mail_info.get('body_html_safe', '') or ''
     body_text      = mail_info.get('body_text', '')      or ''
 
-    # Применяем процент отображения
+    # Применяем процент отображения (только для писем длиннее body_min_chars)
     body_html_safe, body_text = _apply_body_percent(
-        body_html_safe, body_text, body_percent
+        body_html_safe, body_text, body_percent, body_min_chars
     )
 
     body_html_safe = body_html_safe or '(нет текстового содержимого)'

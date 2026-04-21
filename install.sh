@@ -209,6 +209,14 @@ if ! [[ "$BODY_PERCENT" =~ ^[0-9]+$ ]] || [[ "$BODY_PERCENT" -gt 100 ]]; then
     BODY_PERCENT=100
 fi
 
+# Минимальный порог для усечения тела (короткие письма показываются целиком)
+read -rp "  Минимальный размер письма для усечения, символов [1000]: " BODY_MIN_CHARS
+BODY_MIN_CHARS="${BODY_MIN_CHARS:-1000}"
+if ! [[ "$BODY_MIN_CHARS" =~ ^[0-9]+$ ]]; then
+    warn "Некорректное значение '$BODY_MIN_CHARS', используем 1000"
+    BODY_MIN_CHARS=1000
+fi
+
 # SSL-сертификат — используем тот же, что PMG применяет для веб-интерфейса (порт 8006)
 SSL_CERT="/etc/pmg/pmg-api.pem"
 
@@ -236,7 +244,7 @@ echo "  Action-сервер:    $PUBLIC_URL"
 echo "  SSL:              $USE_SSL"
 echo "  Cron интервал:    */$CRON_INTERVAL минут"
 echo "  TTL токенов:      $TOKEN_TTL дней"
-echo "  Показ тела:       $BODY_PERCENT%"
+echo "  Показ тела:       $BODY_PERCENT% (порог: $BODY_MIN_CHARS симв.)"
 echo
 read -rp "Продолжить установку? [Y/n]: " confirm
 [[ "${confirm,,}" != "n" ]] || { info "Установка отменена."; exit 0; }
@@ -360,8 +368,9 @@ user     =
 password =
 
 [notifications]
-mail_from    = ${MAIL_FROM}
-body_percent = ${BODY_PERCENT}
+mail_from      = ${MAIL_FROM}
+body_percent   = ${BODY_PERCENT}
+body_min_chars = ${BODY_MIN_CHARS}
 EOF
 
 chown root:pmg-quarantine "$CONFIG_FILE"
