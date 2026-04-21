@@ -242,15 +242,29 @@ read -rp "Продолжить установку? [Y/n]: " confirm
 [[ "${confirm,,}" != "n" ]] || { info "Установка отменена."; exit 0; }
 
 # =============================================================================
-section "7. Создание директорий"
+section "7. Создание пользователя и директорий"
 # =============================================================================
+
+# Системный пользователь для action-сервера (не root)
+if ! id pmg-quarantine &>/dev/null; then
+    adduser --system --group --no-create-home --shell /usr/sbin/nologin pmg-quarantine
+    ok "Пользователь pmg-quarantine создан"
+else
+    ok "Пользователь pmg-quarantine уже существует"
+fi
 
 for dir in "$INSTALL_LIB" "$INSTALL_ETC" "$INSTALL_VAR"; do
     mkdir -p "$dir"
     ok "Директория: $dir"
 done
 
+# state.db — создаём заранее с правильным владельцем
+touch "$INSTALL_VAR/state.db"
+chown pmg-quarantine:pmg-quarantine "$INSTALL_VAR/state.db"
+chmod 600 "$INSTALL_VAR/state.db"
+
 touch "$INSTALL_LOG"
+chown pmg-quarantine:pmg-quarantine "$INSTALL_LOG"
 chmod 640 "$INSTALL_LOG"
 ok "Лог-файл: $INSTALL_LOG"
 
@@ -265,7 +279,8 @@ if [[ -f "$SECRET_FILE" ]]; then
     warn "ВНИМАНИЕ: старые ссылки в уже отправленных письмах перестанут работать!"
 else
     python3 -c "import secrets; open('$SECRET_FILE','w').write(secrets.token_hex(64))"
-    chmod 600 "$SECRET_FILE"
+    chown root:pmg-quarantine "$SECRET_FILE"
+    chmod 640 "$SECRET_FILE"
     ok "HMAC-секрет сгенерирован: $SECRET_FILE"
 fi
 
@@ -343,6 +358,7 @@ mail_from    = ${MAIL_FROM}
 body_percent = ${BODY_PERCENT}
 EOF
 
+chown root:pmg-quarantine "$CONFIG_FILE"
 chmod 640 "$CONFIG_FILE"
 ok "Конфиг: $CONFIG_FILE"
 
@@ -367,7 +383,20 @@ EOF
 ok "Cron: $CRON_FILE (каждые $CRON_INTERVAL мин.)"
 
 # =============================================================================
-section "12. Firewall"
+section "12. Настройка sudo для action-сервера"
+# =============================================================================
+
+SUDOERS_FILE="/etc/sudoers.d/pmg-quarantine-junk"
+cat > "$SUDOERS_FILE" <<'EOF'
+# pmg-quarantine-junk: разрешаем action-серверу (pmg-quarantine) запускать
+# pmg-quarantine-do-action от root (необходимо для доступа к PMG Perl-модулям)
+pmg-quarantine ALL=(root) NOPASSWD: /usr/local/bin/pmg-quarantine-do-action
+EOF
+chmod 440 "$SUDOERS_FILE"
+ok "Sudoers: $SUDOERS_FILE"
+
+# =============================================================================
+section "13. Firewall (локальный)"
 # =============================================================================
 
 if command -v iptables &>/dev/null; then
@@ -397,7 +426,7 @@ else
 fi
 
 # =============================================================================
-section "13. Ночные отчёты PMG о карантине"
+section "14. Ночные отчёты PMG о карантине"
 
 # PMG может отправлять пользователям сводку карантина по расписанию (reportstyle).
 # Наша система уведомляет о каждом письме в реальном времени —
@@ -442,7 +471,7 @@ print "OK\n";
     fi
 fi
 
-section "14. Запуск systemd-сервиса"
+section "15. Запуск systemd-сервиса"
 # =============================================================================
 
 systemctl daemon-reload
@@ -460,7 +489,7 @@ else
 fi
 
 # =============================================================================
-section "15. Проверка работоспособности"
+section "16. Проверка работоспособности"
 # =============================================================================
 
 sleep 1
@@ -476,7 +505,7 @@ if command -v curl &>/dev/null; then
 fi
 
 # =============================================================================
-section "16. Первый запуск notifier (тест)"
+section "17. Первый запуск notifier (тест)"
 # =============================================================================
 
 info "Запускаем pmg-quarantine-notifier для проверки..."

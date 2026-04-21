@@ -45,6 +45,7 @@ files=(
     /etc/systemd/system/pmg-quarantine-action-server.service
     /etc/cron.d/pmg-quarantine-junk
     /etc/logrotate.d/pmg-quarantine-junk
+    /etc/sudoers.d/pmg-quarantine-junk
 )
 for f in "${files[@]}"; do
     [[ -e "$f" ]] && { rm -f "$f"; ok "Удалён: $f"; } || true
@@ -56,6 +57,12 @@ done
 }
 
 systemctl daemon-reload
+
+# Удаляем системного пользователя
+if id pmg-quarantine &>/dev/null; then
+    deluser --system pmg-quarantine 2>/dev/null || true
+    ok "Пользователь pmg-quarantine удалён"
+fi
 
 echo
 echo -e "${GREEN}Удаление завершено.${RESET}"

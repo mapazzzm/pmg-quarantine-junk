@@ -1,13 +1,12 @@
 """
 pmg-quarantine-junk: shared utilities
-Token generation/validation, config loading, logging setup, IMAP helpers.
+Token generation/validation, config loading, logging setup.
 """
 
 import base64
 import configparser
 import hmac
 import hashlib
-import imaplib
 import logging
 import os
 import sqlite3
@@ -140,20 +139,20 @@ def mark_notified(conn: sqlite3.Connection, quarantine_id: str,
     )
     conn.commit()
 
-def is_token_used(conn: sqlite3.Connection, token: str) -> bool:
+def try_use_token(conn: sqlite3.Connection, token: str, action: str) -> bool:
+    """
+    Atomically mark token as used.
+    Returns True if token was new (action should proceed).
+    Returns False if token was already used (replay attempt).
+    Uses INSERT OR IGNORE to avoid TOCTOU race between check and write.
+    """
     h = hashlib.sha256(token.encode()).hexdigest()
-    row = conn.execute(
-        "SELECT 1 FROM used_tokens WHERE token_hash=?", (h,)
-    ).fetchone()
-    return row is not None
-
-def mark_token_used(conn: sqlite3.Connection, token: str, action: str):
-    h = hashlib.sha256(token.encode()).hexdigest()
-    conn.execute(
+    cursor = conn.execute(
         "INSERT OR IGNORE INTO used_tokens VALUES (?,?,?)",
         (h, int(time.time()), action)
     )
     conn.commit()
+    return cursor.rowcount == 1
 
 def cleanup_expired(conn: sqlite3.Connection):
     now = int(time.time())
@@ -161,85 +160,3 @@ def cleanup_expired(conn: sqlite3.Connection):
     # Keep used_tokens for 30 days to prevent replay even after cleanup
     conn.execute("DELETE FROM used_tokens WHERE used_at < ?", (now - 30*86400,))
     conn.commit()
-
-# ---------------------------------------------------------------------------
-# IMAP helpers
-# ---------------------------------------------------------------------------
-
-def imap_connect(host: str, port: int, use_ssl: bool = True,
-                 timeout: int = 30) -> imaplib.IMAP4:
-    if use_ssl:
-        return imaplib.IMAP4_SSL(host, port, timeout=timeout)
-    else:
-        return imaplib.IMAP4(host, port)
-
-def imap_login_plain(imap: imaplib.IMAP4, authzid: str,
-                     authcid: str, password: str):
-    """
-    SASL PLAIN login with delegation (Zimbra/Carbonio admin impersonation).
-    authzid  = target user (e.g. user@domain.com)
-    authcid  = authenticating user (e.g. admin@domain.com)
-    password = authenticating user's password
-    """
-    auth_bytes = f"{authzid}\x00{authcid}\x00{password}".encode('utf-8')
-    encoded = base64.b64encode(auth_bytes)
-    imap.authenticate('PLAIN', lambda _: encoded)
-
-def imap_find_junk_folder(imap: imaplib.IMAP4) -> str:
-    """
-    Find the Junk/Spam folder by listing all folders and checking
-    special-use attributes (\\Junk) or common names.
-    Returns the folder name, or 'Junk' as fallback.
-    """
-    candidates = []
-    try:
-        status, folder_list = imap.list()
-        if status == 'OK':
-            for item in folder_list:
-                if not item:
-                    continue
-                raw = item.decode('utf-8', errors='replace')
-                # Check for \\Junk special-use attribute
-                if r'\Junk' in raw or r'\Spam' in raw:
-                    name = _extract_folder_name(raw)
-                    if name:
-                        return name
-                candidates.append(raw)
-
-        # Fall back: look for common names
-        for raw in candidates:
-            name = _extract_folder_name(raw)
-            if name and name.lower() in ('junk', 'spam', 'junk e-mail',
-                                         'junk email', 'спам', 'нежелательная почта'):
-                return name
-    except Exception:
-        pass
-    return 'Junk'
-
-def imap_ensure_folder(imap: imaplib.IMAP4, folder: str):
-    """Create folder if it doesn't exist."""
-    status, _ = imap.select(f'"{folder}"')
-    if status != 'OK':
-        imap.create(f'"{folder}"')
-
-def imap_append_message(imap: imaplib.IMAP4, folder: str, msg_bytes: bytes):
-    """Append a raw RFC 822 message to folder."""
-    imap.append(
-        f'"{folder}"',
-        r'(\Seen)',                          # mark as read — user sees it without unread badge
-        imaplib.Time2Internaldate(time.time()),
-        msg_bytes
-    )
-
-def _extract_folder_name(raw: str) -> str:
-    """Extract folder name from IMAP LIST response line."""
-    import re
-    # Try quoted name first: ... "folder name"
-    m = re.search(r'"([^"]+)"\s*$', raw)
-    if m:
-        return m.group(1)
-    # Unquoted name at end
-    parts = raw.rsplit(' ', 1)
-    if len(parts) == 2:
-        return parts[-1].strip()
-    return ''

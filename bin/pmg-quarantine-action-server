@@ -20,7 +20,7 @@ from flask import Flask, request, Response
 sys.path.insert(0, '/usr/local/lib/pmg-quarantine-junk')
 from common import (
     load_config, load_secret, setup_logging,
-    validate_token, open_state_db, is_token_used, mark_token_used
+    validate_token, open_state_db, try_use_token
 )
 
 app = Flask(__name__)
@@ -164,16 +164,16 @@ def action():
         return Response(page_error('Недействительная или повреждённая ссылка.'),
                         status=403, mimetype='text/html')
 
-    # Защита от повторного использования
-    if is_token_used(state, token):
+    # Атомарная защита от повторного использования (INSERT OR IGNORE, нет TOCTOU)
+    if not try_use_token(state, token, action):
         log.info("Token already used: qid=%s action=%s pmail=%s",
                  quarantine_id, action, pmail)
         return Response(page_already_done(), status=200, mimetype='text/html')
 
-    # Вызов Perl-скрипта
+    # Вызов Perl-скрипта через sudo (сервис работает от непривилегированного пользователя)
     try:
         result = subprocess.run(
-            [ACTION_BINARY, quarantine_id, action],
+            ['sudo', '-n', ACTION_BINARY, quarantine_id, action],
             capture_output=True, text=True, timeout=30
         )
         output = result.stdout.strip()
@@ -185,7 +185,6 @@ def action():
 
             if status_line.startswith('ALREADY_PROCESSED'):
                 # Письмо уже обработали через PMG UI — засчитываем как успех
-                mark_token_used(state, token, action)
                 return Response(page_already_done(), status=200, mimetype='text/html')
 
             if status_line.startswith('NOTFOUND'):
@@ -195,7 +194,6 @@ def action():
                     status=404, mimetype='text/html'
                 )
 
-            mark_token_used(state, token, action)
             return Response(page_ok(action, quarantine_id),
                             status=200, mimetype='text/html')
 
