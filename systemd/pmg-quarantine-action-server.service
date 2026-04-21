@@ -1,0 +1,27 @@
+[Unit]
+Description=PMG Quarantine Junk — action server
+Documentation=https://github.com/your-org/pmg-quarantine-junk
+After=network.target postgresql.service redis-server.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/pmg-quarantine-action-server
+Restart=on-failure
+RestartSec=10
+
+# Логи идут в /var/log/pmg-quarantine-junk.log через logging в коде,
+# но stderr systemd тоже собирает
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pmg-quarantine-action-server
+
+# Ограничения безопасности
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pmg-quarantine-junk /var/log
+ReadOnlyPaths=/etc/pmg-quarantine-junk /etc/pmg /var/spool/pmg /usr/local/lib/pmg-quarantine-junk
+
+[Install]
+WantedBy=multi-user.target

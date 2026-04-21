@@ -1,0 +1,216 @@
+# pmg-quarantine-junk
+
+Система интерактивных уведомлений о карантине для **Proxmox Mail Gateway (PMG)**.
+
+Вместо безликого ночного отчёта пользователь получает письмо **во Входящие** сразу после попадания сообщения в карантин. Письмо содержит превью заблокированного сообщения и две кнопки действия:
+
+| Кнопка | Действие |
+|--------|----------|
+| ✅ **Не спам — доставить** | Отправитель → Whitelist PMG, письмо доставляется из карантина |
+| ✖ **Спам — заблокировать** | Отправитель → Blacklist PMG, письмо удаляется из карантина |
+
+Нажатие кнопки открывает страницу с результатом — никакой авторизации от пользователя не требуется.
+
+---
+
+## Требования
+
+| Компонент | Версия |
+|-----------|--------|
+| Proxmox Mail Gateway | 7.x / 8.x |
+| Debian | 11 (Bullseye) / 12 (Bookworm) |
+| Python | 3.9+ (устанавливается автоматически) |
+| PostgreSQL | входит в стандартную установку PMG |
+
+Почтовый сервер для доставки уведомлений: **любой SMTP-relay** (Carbonio, Zimbra, Postfix и т.п.).
+
+---
+
+## Быстрая установка
+
+Выполните на сервере PMG от root:
+
+```bash
+git clone https://github.com/mapazzzm/pmg-quarantine-junk.git
+cd pmg-quarantine-junk
+bash install.sh
+```
+
+Или однострочником без клонирования:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/mapazzzm/pmg-quarantine-junk/main/install.sh)
+```
+
+> Скрипт задаёт несколько вопросов (hostname, порт, адрес отправителя) и делает всё остальное автоматически.
+
+---
+
+## Что делает установочный скрипт
+
+1. Проверяет ОС (Debian/Ubuntu), наличие PMG, доступность базы данных
+2. Устанавливает Python 3 и pip, если отсутствуют
+3. Устанавливает Python-зависимости: `psycopg2-binary`, `flask`
+4. Спрашивает параметры: hostname PMG, адрес отправителя, порт action-сервера
+5. Автоматически читает из конфига PMG: relay-сервер, SSL-сертификат
+6. Генерирует уникальный HMAC-секрет для подписи токенов
+7. Устанавливает файлы в стандартные системные пути
+8. Создаёт конфиг `/etc/pmg-quarantine-junk/config.ini`
+9. Включает и запускает systemd-сервис `pmg-quarantine-action-server`
+10. Добавляет cron-задание (по умолчанию каждые 5 минут, настраивается)
+11. Предлагает отключить штатные ночные отчёты PMG (они станут дублирующими)
+12. Выполняет тестовый прогон notifier и health-check action-сервера
+
+---
+
+## Архитектура
+
+```
+Cron (*/5 минут)
+  └─► pmg-quarantine-notifier
+        ├─ Читает CMailStore + CMSReceivers (PostgreSQL / Proxmox_ruledb)
+        ├─ Разбирает .eml из /var/spool/pmg/spam/
+        ├─ Генерирует HMAC-SHA256 токены (TTL 7 дней)
+        ├─ Отправляет HTML-письмо во Входящие (SMTP → почтовый сервер)
+        └─ Запоминает уведомлённые ID (SQLite) — повторов нет
+
+Пользователь нажимает кнопку в письме
+  └─► HTTPS GET https://pmg.example.com:8765/action?token=...
+        └─► pmg-quarantine-action-server (Flask, systemd)
+              ├─ Проверяет HMAC-подпись и срок действия токена
+              ├─ Проверяет, не использован ли токен повторно (SQLite)
+              ├─ Вызывает pmg-quarantine-do-action <id> <whitelist|blacklist>
+              │     └─► PMG::Quarantine Perl-модули (прямой вызов без API)
+              └─► Возвращает HTML-страницу с результатом действия
+```
+
+---
+
+## Содержимое уведомления
+
+Каждое письмо-уведомление содержит:
+
+- **Кнопки действий** — вверху письма, чтобы не нужно было скроллить
+- **Реквизиты** — От кого, Тема, Дата оригинального письма
+- **Вложения** — список файлов с именами, типами и размерами (если есть)
+- **Тело письма** — полный текст/HTML с сохранением форматирования (ссылки и изображения удалены в целях безопасности)
+- **Ссылка на карантин PMG** — с автоматической авторизацией (как в штатных отчётах PMG)
+
+Процент отображаемого текста настраивается параметром `body_percent` (0–100, по умолчанию 100).
+
+---
+
+## Настройка файрвола
+
+Action-сервер слушает на порту **8765** (настраивается). Этот порт должен быть доступен снаружи — пользователи нажимают кнопки из браузера.
+
+На самом сервере PMG файрвол не требуется (если не используется `pve-firewall`).  
+Откройте порт на **внешнем роутере/файрволе** (Mikrotik, pfSense и т.п.):
+
+```
+Назначение: IP_вашего_PMG:8765
+Протокол: TCP
+Направление: входящий (из интернета)
+```
+
+---
+
+## Файловая структура после установки
+
+```
+/usr/local/bin/
+  pmg-quarantine-notifier         ← cron-скрипт сканирования карантина
+  pmg-quarantine-action-server    ← HTTPS-сервис обработки нажатий кнопок
+  pmg-quarantine-do-action        ← Perl: прямой вызов PMG::Quarantine
+  pmg-quarantine-gen-ticket       ← Perl: генерация авто-auth ссылки PMG
+
+/usr/local/lib/pmg-quarantine-junk/
+  common.py                       ← общие утилиты (токены, SQLite, SMTP)
+
+/etc/pmg-quarantine-junk/
+  config.ini                      ← конфигурация (создаётся при установке)
+  secret.key                      ← HMAC-секрет (права 600, только root)
+
+/var/lib/pmg-quarantine-junk/
+  state.db                        ← SQLite: уведомлённые ID, использованные токены
+
+/var/log/pmg-quarantine-junk.log  ← единый лог (logrotate: 14 дней)
+
+/etc/systemd/system/
+  pmg-quarantine-action-server.service
+
+/etc/cron.d/
+  pmg-quarantine-junk
+```
+
+---
+
+## Конфигурация
+
+Файл: `/etc/pmg-quarantine-junk/config.ini`  
+Пример: [`config/config.ini.example`](config/config.ini.example)
+
+Обязательные параметры:
+
+| Параметр | Описание |
+|----------|----------|
+| `[pmg] hostname` | FQDN PMG-сервера (публичный) |
+| `[action_server] public_url` | Публичный URL action-сервера, вставляется в письма |
+| `[smtp] host` | IP/hostname SMTP-сервера для отправки уведомлений |
+| `[notifications] mail_from` | Адрес отправителя уведомлений |
+
+После изменения конфига:
+
+```bash
+systemctl restart pmg-quarantine-action-server
+```
+
+---
+
+## Управление
+
+```bash
+# Статус сервиса
+systemctl status pmg-quarantine-action-server
+
+# Логи в реальном времени
+journalctl -u pmg-quarantine-action-server -f
+tail -f /var/log/pmg-quarantine-junk.log
+
+# Ручной запуск notifier (для теста)
+/usr/local/bin/pmg-quarantine-notifier
+
+# Health-check action-сервера
+curl -sk https://pmg.example.com:8765/health
+```
+
+---
+
+## Безопасность
+
+- **HMAC-SHA256**: все ссылки в письмах подписаны уникальным секретом, хранящимся только на сервере
+- **TTL токенов**: по умолчанию 7 дней (настраивается в `[tokens] ttl_days`)
+- **Защита от повторного использования**: после нажатия кнопки токен помечается использованным в SQLite
+- **Разделение действий**: токен для whitelist не сработает как blacklist и наоборот
+- **Без PMG API**: действия выполняются через прямой вызов Perl-модулей PMG от root — не открывает дополнительных сетевых поверхностей атаки
+- **SSL**: action-сервер использует тот же Let's Encrypt сертификат, что и веб-интерфейс PMG
+
+---
+
+## Удаление
+
+```bash
+bash uninstall.sh
+```
+
+Конфиг, база данных и логи сохраняются. Для полного удаления:
+
+```bash
+rm -rf /etc/pmg-quarantine-junk /var/lib/pmg-quarantine-junk /var/log/pmg-quarantine-junk.log
+```
+
+---
+
+## Лицензия
+
+MIT

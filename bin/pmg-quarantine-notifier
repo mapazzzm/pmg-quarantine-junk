@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+"""
+pmg-quarantine-notifier — сканирует карантин PMG, отправляет уведомления
+с кнопками "Не спам" / "Спам" на почту пользователей (во Входящие).
+
+Запускается по cron (рекомендуется каждые 15 минут).
+"""
+
+import email as email_lib
+import email.header
+import email.utils
+import html as html_module
+import logging
+import os
+import re
+import smtplib
+import sys
+import time
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import psycopg2
+import psycopg2.extras
+
+# Добавляем путь к общей библиотеке
+sys.path.insert(0, '/usr/local/lib/pmg-quarantine-junk')
+from common import (
+    load_config, load_secret, setup_logging,
+    generate_token, open_state_db, is_notified, mark_notified, cleanup_expired
+)
+
+PMG_SPOOL        = '/var/spool/pmg'
+GEN_TICKET_BIN   = '/usr/local/bin/pmg-quarantine-gen-ticket'
+
+
+# ---------------------------------------------------------------------------
+# PMG авто-авторизационная ссылка
+# ---------------------------------------------------------------------------
+
+def get_pmg_quarantine_url(pmail: str, cfg, log) -> str:
+    """
+    Генерирует ссылку на карантин PMG с RSA-тикетом для автоматической
+    авторизации пользователя (тот же механизм, что использует PMG в отчётах).
+    При ошибке возвращает обычную ссылку без тикета.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            [GEN_TICKET_BIN, pmail],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            if url.startswith('http'):
+                return url
+        log.warning("gen-ticket failed for %s: %s", pmail, result.stderr.strip())
+    except Exception as e:
+        log.warning("Cannot generate PMG ticket for %s: %s", pmail, e)
+
+    # Fallback: обычная ссылка без авторизации
+    hostname = cfg.get('pmg', 'hostname', fallback='localhost')
+    port     = cfg.get('pmg', 'port', fallback='8006')
+    return f"https://{hostname}:{port}/quarantine"
+
+
+# ---------------------------------------------------------------------------
+# PMG Database
+# ---------------------------------------------------------------------------
+
+def get_pending_quarantine(cfg):
+    """Возвращает список новых записей карантина типа 'spam', ещё не уведомлённых."""
+    conn = psycopg2.connect(
+        host=cfg.get('pmg', 'db_host', fallback='/var/run/postgresql'),
+        dbname=cfg.get('pmg', 'db_name', fallback='Proxmox_ruledb'),
+        user=cfg.get('pmg', 'db_user', fallback='root'),
+        port=cfg.get('pmg', 'db_port', fallback='5432'),
+        cursor_factory=psycopg2.extras.RealDictCursor
+    )
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            C.cid,
+            C.rid,
+            C.sender,
+            C.file,
+            C.spamlevel,
+            C.header,
+            C.time::text AS time_str,
+            R.pmail,
+            R.receiver,
+            R.ticketid,
+            R.status,
+            'C' || C.cid || 'R' || C.rid || 'T' || R.ticketid AS quarantine_id
+        FROM   CMailStore C
+        JOIN   CMSReceivers R
+               ON  C.cid = R.cmailstore_cid
+               AND C.rid = R.cmailstore_rid
+        WHERE  C.qtype = 'S'
+          AND  R.status = 'N'
+        ORDER  BY C.time DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Парсинг письма из файла карантина
+# ---------------------------------------------------------------------------
+
+def decode_mime_header(value: str) -> str:
+    if not value:
+        return ''
+    parts = email.header.decode_header(value)
+    decoded = []
+    for part, charset in parts:
+        if isinstance(part, bytes):
+            decoded.append(part.decode(charset or 'utf-8', errors='replace'))
+        else:
+            decoded.append(part)
+    return ' '.join(decoded)
+
+
+from html.parser import HTMLParser as _HTMLParser
+
+
+class _HTMLSanitizer(_HTMLParser):
+    """
+    Санитайзер HTML для вставки тела письма в уведомление.
+
+    Оставляет: всё визуальное форматирование (теги, inline-стили, классы).
+    Удаляет целиком (включая содержимое): <style>, <script>, <head>.
+    Удаляет тег, но оставляет текст внутри: <a> (ссылки становятся обычным текстом).
+    Удаляет без следа: <img>, <link>, <meta>, <base>.
+    Нейтрализует: href/src/action/on* атрибуты во всех тегах.
+    """
+
+    _SKIP_WITH_CONTENT = frozenset({'style', 'script', 'head'})
+    _VOID_REMOVE       = frozenset({'img', 'link', 'meta', 'base', 'input'})
+    _STRIP_TAG_ONLY    = frozenset({'a'})          # тег убираем, текст внутри оставляем
+    _UNSAFE_ATTRS      = frozenset({               # атрибуты, которые убираем
+        'href', 'src', 'action', 'formaction', 'xlink:href',
+        'onclick', 'onload', 'onerror', 'onmouseover', 'onmouseout',
+        'onfocus', 'onblur', 'onsubmit', 'onchange',
+    })
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self._out   = []
+        self._depth = 0      # глубина вложенности в _SKIP_WITH_CONTENT
+
+    def handle_starttag(self, tag, attrs):
+        if self._depth:
+            self._depth += 1
+            return
+        if tag in self._SKIP_WITH_CONTENT:
+            self._depth = 1
+            return
+        if tag in self._VOID_REMOVE:
+            return
+        if tag in self._STRIP_TAG_ONLY:
+            return   # текст внутри <a>...</a> попадёт через handle_data
+        # Безопасный тег — фильтруем атрибуты
+        safe = [(k, v) for k, v in attrs
+                if k.lower() not in self._UNSAFE_ATTRS]
+        if safe:
+            attrs_str = ' '.join(
+                f'{k}="{v}"' if v is not None else k
+                for k, v in safe
+            )
+            self._out.append(f'<{tag} {attrs_str}>')
+        else:
+            self._out.append(f'<{tag}>')
+
+    def handle_endtag(self, tag):
+        if self._depth:
+            self._depth -= 1
+            return
+        if tag in self._SKIP_WITH_CONTENT | self._VOID_REMOVE | self._STRIP_TAG_ONLY:
+            return
+        self._out.append(f'</{tag}>')
+
+    def handle_data(self, data):
+        if self._depth:
+            return
+        self._out.append(data)
+
+    def handle_entityref(self, name):
+        if not self._depth:
+            self._out.append(f'&{name};')
+
+    def handle_charref(self, name):
+        if not self._depth:
+            self._out.append(f'&#{name};')
+
+    def get_output(self) -> str:
+        return ''.join(self._out)
+
+
+def _sanitize_html(raw_html: str) -> str:
+    """
+    Возвращает очищенный HTML: форматирование сохранено, ссылки/трекеры удалены.
+    Если есть <body>, санитизируем только его содержимое — это надёжнее,
+    чем парсить весь документ с <head> и MSO-комментариями.
+    """
+    # Вырезаем содержимое <body>...</body> если оно есть
+    m = re.search(r'<body[^>]*>(.*)</body>', raw_html,
+                  flags=re.DOTALL | re.IGNORECASE)
+    content = m.group(1) if m else raw_html
+
+    p = _HTMLSanitizer()
+    p.feed(content)
+    return p.get_output()
+
+
+def _apply_body_percent(html_body: str, text_body: str, percent: int) -> tuple:
+    """
+    Обрезает тело письма до заданного процента.
+    Для HTML — обрезает по символам с добавлением предупреждения.
+    Для plain text — аналогично.
+    Возвращает (html_body, text_body).
+    """
+    if percent <= 0:
+        return '', ''
+    if percent >= 100:
+        return html_body, text_body
+
+    def _truncate(text: str, pct: int) -> tuple[str, bool]:
+        limit = max(1, int(len(text) * pct / 100))
+        if len(text) <= limit:
+            return text, False
+        return text[:limit], True
+
+    html_cut, html_was_cut = _truncate(html_body, percent)
+    text_cut, text_was_cut = _truncate(text_body, percent)
+
+    if html_was_cut:
+        html_cut += (
+            f'<p style="color:#999;font-size:11px;font-style:italic;">'
+            f'… показано {percent}% текста письма</p>'
+        )
+    if text_was_cut:
+        text_cut += f'\n\n… показано {percent}% текста письма'
+
+    return html_cut, text_cut
+
+
+def _human_size(n: int) -> str:
+    for unit in ('Б', 'КБ', 'МБ', 'ГБ'):
+        if n < 1024:
+            return f"{n} {unit}"
+        n //= 1024
+    return f"{n} ГБ"
+
+
+def parse_quarantine_file(filepath: str) -> dict:
+    """
+    Разбирает .eml из карантина.
+    Возвращает: subject, from, date, body_text, body_html_safe, attachments.
+    body_html_safe — текст с <br> вместо переносов строк, HTML-экранирован.
+    attachments — список dict(name, mime, size_hr).
+    """
+
+
+    result = {
+        'subject':         '(без темы)',
+        'from':            '(неизвестно)',
+        'date':            '',
+        'body_text':       '',       # raw text для text/plain части письма
+        'body_html_safe':  '',       # тот же текст, готовый для вставки в HTML
+        'attachments':     [],       # [{name, mime, size_hr}, ...]
+        'has_html_only':   False,    # True если есть только text/html, нет plain
+    }
+
+    try:
+        with open(filepath, 'rb') as f:
+            msg = email_lib.message_from_bytes(f.read())
+
+        result['subject'] = decode_mime_header(msg.get('Subject', '')) or '(без темы)'
+        result['from']    = decode_mime_header(msg.get('From', ''))    or '(неизвестно)'
+        result['date']    = msg.get('Date', '')
+
+        # Убираем префикс "SPAM: " добавляемый PMG
+        subj = result['subject']
+        if subj.upper().startswith('SPAM:'):
+            result['subject'] = subj[5:].strip()
+
+        plain_parts = []
+        html_parts  = []
+        attachments = []
+
+        parts = list(msg.walk()) if msg.is_multipart() else [msg]
+
+        for part in parts:
+            ct   = part.get_content_type()
+            disp = (part.get('Content-Disposition') or '').lower()
+            fname = decode_mime_header(part.get_filename() or '')
+
+            # Вложение — любой part с filename или disposition=attachment
+            if fname or 'attachment' in disp:
+                payload = part.get_payload(decode=True)
+                size = len(payload) if payload else 0
+                attachments.append({
+                    'name':    fname or '(без имени)',
+                    'mime':    ct,
+                    'size_hr': _human_size(size),
+                })
+                continue
+
+            # Тело письма
+            if ct == 'text/plain':
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset('utf-8') or 'utf-8'
+                    plain_parts.append(payload.decode(charset, errors='replace'))
+
+            elif ct == 'text/html':
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset('utf-8') or 'utf-8'
+                    html_parts.append(payload.decode(charset, errors='replace'))
+
+        # --- HTML-версия тела (для HTML-части письма уведомления) ---
+        if html_parts:
+            # Санитизируем: убираем скрипты/стили/ссылки, форматирование сохраняем
+            sanitized = _sanitize_html('\n'.join(html_parts))
+            # Убираем невидимые spacer-символы
+            sanitized = re.sub(r'\u2800+', ' ', sanitized)
+            sanitized = re.sub(r'[\u200b-\u200f\ufeff\u034f]+', '', sanitized)
+            result['body_html_safe'] = sanitized
+            result['has_html_only'] = not bool(plain_parts)
+        elif plain_parts:
+            # Только plain text → экранируем и заменяем переносы на <br>
+            body_plain = '\n'.join(plain_parts).strip()
+            result['body_html_safe'] = (
+                html_module.escape(body_plain).replace('\n', '<br>\n')
+            )
+
+        # --- Plain text-версия (для text/plain части уведомления и fallback) ---
+        if plain_parts:
+            body = '\n'.join(plain_parts).strip()
+        elif html_parts:
+            # Из HTML выжимаем текст как запасной вариант
+            raw = '\n'.join(html_parts)
+            body = re.sub(r'<style[^>]*>.*?</style>', '', raw,
+                          flags=re.DOTALL | re.IGNORECASE)
+            body = re.sub(r'<script[^>]*>.*?</script>', '', body,
+                          flags=re.DOTALL | re.IGNORECASE)
+            body = re.sub(r'<(?:br|p|div|tr|li|h[1-6])[^>]*>', '\n', body,
+                          flags=re.IGNORECASE)
+            body = re.sub(r'<[^>]+>', ' ', body)
+            body = re.sub(r'&nbsp;', ' ', body)
+            body = re.sub(r'&#\d+;', '', body)
+            body = re.sub(r'&[a-zA-Z]+;', '', body)
+            body = re.sub(r'\u2800+', ' ', body)
+        else:
+            body = ''
+
+        body = re.sub(r'[\u00ad\u200b-\u200f\ufeff\u034f]+', '', body)
+        body = re.sub(r'[ \t]{4,}', ' ', body)
+        body = re.sub(r'\n{3,}', '\n\n', body)
+        body = re.sub(r'^[ \t\d]{0,5}$', '', body, flags=re.MULTILINE)
+        result['body_text'] = body.strip()
+
+        result['attachments'] = attachments
+
+    except Exception as e:
+        result['body_text']      = f'(не удалось прочитать содержимое: {e})'
+        result['body_html_safe'] = html_module.escape(result['body_text'])
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# HTML-шаблон уведомления
+# ---------------------------------------------------------------------------
+
+HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Письмо в карантине</title>
+</head>
+<body style="margin:0;padding:0;background:#f0f2f5;font-family:Arial,Helvetica,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f2f5;padding:30px 0;">
+  <tr><td align="center">
+  <table width="620" cellpadding="0" cellspacing="0"
+         style="background:#fff;border-radius:10px;overflow:hidden;
+                box-shadow:0 2px 10px rgba(0,0,0,0.12);max-width:620px;">
+
+    <!-- ═══ Шапка ═══ -->
+    <tr>
+      <td style="background:#c0392b;padding:22px 32px;">
+        <p style="margin:0;color:#fff;font-size:19px;font-weight:bold;">
+          &#128274; Письмо задержано фильтром
+        </p>
+        <p style="margin:5px 0 0;color:#f5b7b1;font-size:12px;">
+          Proxmox Mail Gateway — карантин спама
+        </p>
+      </td>
+    </tr>
+
+    <!-- ═══ Кнопки действий (вверху, чтобы не скролить) ═══ -->
+    <tr>
+      <td style="padding:24px 32px 20px;background:#fff8f8;border-bottom:1px solid #f0dede;">
+        <p style="margin:0 0 14px;font-size:14px;color:#444;font-weight:bold;">
+          Что сделать с этим письмом?
+        </p>
+        <table cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="padding-right:12px;">
+              <a href="{whitelist_url}"
+                 style="display:inline-block;background:#27ae60;color:#fff;
+                        padding:13px 24px;text-decoration:none;border-radius:7px;
+                        font-size:15px;font-weight:bold;">
+                &#10003;&nbsp; Не спам — доставить
+              </a>
+            </td>
+            <td>
+              <a href="{blacklist_url}"
+                 style="display:inline-block;background:#c0392b;color:#fff;
+                        padding:13px 24px;text-decoration:none;border-radius:7px;
+                        font-size:15px;font-weight:bold;">
+                &#10007;&nbsp; Спам — заблокировать
+              </a>
+            </td>
+          </tr>
+        </table>
+        <p style="margin:10px 0 0;font-size:11px;color:#bbb;">
+          Нажав «Не спам», вы получите письмо и добавите отправителя в белый список.<br>
+          Нажав «Спам», письмо будет удалено, отправитель — в чёрный список.
+          Ссылки действительны {ttl_days} дн.
+        </p>
+      </td>
+    </tr>
+
+    <!-- ═══ Реквизиты письма ═══ -->
+    <tr>
+      <td style="padding:20px 32px 0;">
+        <table width="100%" cellpadding="7" cellspacing="0"
+               style="border-collapse:collapse;font-size:14px;">
+          <tr>
+            <td style="color:#888;width:80px;white-space:nowrap;
+                       border-bottom:1px solid #f2f2f2;">От:</td>
+            <td style="color:#222;font-weight:bold;
+                       border-bottom:1px solid #f2f2f2;">{from_addr}</td>
+          </tr>
+          <tr>
+            <td style="color:#888;border-bottom:1px solid #f2f2f2;">Кому:</td>
+            <td style="color:#444;border-bottom:1px solid #f2f2f2;">{to_addr}</td>
+          </tr>
+          <tr>
+            <td style="color:#888;border-bottom:1px solid #f2f2f2;">Тема:</td>
+            <td style="color:#222;border-bottom:1px solid #f2f2f2;">{subject}</td>
+          </tr>
+          <tr>
+            <td style="color:#888;border-bottom:1px solid #f2f2f2;">Дата:</td>
+            <td style="color:#555;border-bottom:1px solid #f2f2f2;">{date}</td>
+          </tr>
+          <tr>
+            <td style="color:#888;">Оценка:</td>
+            <td>
+              <span style="background:#e74c3c;color:#fff;padding:2px 9px;
+                           border-radius:12px;font-size:12px;font-weight:bold;">
+                спам {spamlevel}/15
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- ═══ Вложения (показываем только если есть) ═══ -->
+    {attachments_block}
+
+    <!-- ═══ Текст письма ═══ -->
+    <tr>
+      <td style="padding:16px 32px 24px;">
+        <p style="margin:0 0 8px;font-size:12px;color:#999;text-transform:uppercase;
+                  letter-spacing:0.5px;">{body_label}</p>
+        <div style="background:#f8f9fa;border:1px solid #e9ecef;border-radius:6px;
+                    padding:16px 18px;font-size:13px;color:#333;line-height:1.7;
+                    word-break:break-word;">
+          {body_html_safe}
+        </div>
+      </td>
+    </tr>
+
+    <!-- ═══ Подвал ═══ -->
+    <tr>
+      <td style="background:#f8f9fa;padding:12px 32px;border-top:1px solid #eee;">
+        <p style="margin:0;font-size:11px;color:#bbb;">
+          ID: {quarantine_id} &nbsp;|&nbsp;
+          <a href="{pmg_url}" style="color:#bbb;">Открыть карантин PMG</a>
+        </p>
+      </td>
+    </tr>
+
+  </table>
+  </td></tr>
+</table>
+</body>
+</html>
+"""
+
+_ATTACHMENTS_BLOCK_TEMPLATE = """\
+    <tr>
+      <td style="padding:12px 32px 0;">
+        <p style="margin:0 0 6px;font-size:12px;color:#999;text-transform:uppercase;
+                  letter-spacing:0.5px;">Вложения</p>
+        <table width="100%" cellpadding="5" cellspacing="0"
+               style="border-collapse:collapse;font-size:13px;">
+          {attachment_rows}
+        </table>
+      </td>
+    </tr>"""
+
+_ATTACHMENT_ROW = """\
+          <tr style="border-bottom:1px solid #f2f2f2;">
+            <td style="color:#555;">&#128206;&nbsp;{name}</td>
+            <td style="color:#999;width:130px;white-space:nowrap;">{mime}</td>
+            <td style="color:#999;width:70px;white-space:nowrap;text-align:right;">{size_hr}</td>
+          </tr>"""
+
+TEXT_TEMPLATE = """\
+Письмо задержано фильтром (карантин PMG)
+=========================================
+От:    {from_addr}
+Кому:  {to_addr}
+Тема:  {subject}
+Дата:  {date}
+Оценка спама: {spamlevel}/15
+{attachments_text}
+Действия:
+  Не спам (доставить + добавить в белый список):
+    {whitelist_url}
+
+  Спам (удалить + добавить в чёрный список):
+    {blacklist_url}
+
+Ссылки действительны {ttl_days} дн. ID: {quarantine_id}
+
+Текст письма:
+-------------
+{body_text}
+"""
+
+
+def _encode_header(value: str) -> str:
+    """RFC 2047: кодирует заголовок если содержит не-ASCII символы."""
+    try:
+        value.encode('ascii')
+        return value          # чисто ASCII — не трогаем
+    except UnicodeEncodeError:
+        return email.header.Header(value, 'utf-8').encode()
+
+
+def _encode_address(addr_str: str) -> str:
+    """
+    RFC 2047: корректно кодирует отображаемое имя в адресе отправителя.
+    'Антиспам-сервер <postmaster@example.com>'
+    → '=?utf-8?...?= <postmaster@example.com>'
+    """
+    name, addr = email.utils.parseaddr(addr_str)
+    if not name:
+        return addr_str
+    try:
+        name.encode('ascii')
+        return addr_str       # имя чисто ASCII — оставляем как есть
+    except UnicodeEncodeError:
+        encoded_name = email.header.Header(name, 'utf-8').encode()
+        return email.utils.formataddr((encoded_name, addr))
+
+
+def _build_attachments_block(attachments: list) -> str:
+    """Возвращает HTML-блок вложений или пустую строку."""
+
+    if not attachments:
+        return ''
+    rows = '\n'.join(
+        _ATTACHMENT_ROW.format(
+            name=html_module.escape(a['name']),
+            mime=html_module.escape(a['mime']),
+            size_hr=a['size_hr'],
+        )
+        for a in attachments
+    )
+    return _ATTACHMENTS_BLOCK_TEMPLATE.format(attachment_rows=rows)
+
+
+def _build_attachments_text(attachments: list) -> str:
+    """Возвращает текстовый блок вложений или пустую строку."""
+    if not attachments:
+        return ''
+    lines = ['\nВложения:']
+    for a in attachments:
+        lines.append(f"  • {a['name']}  ({a['mime']}, {a['size_hr']})")
+    return '\n'.join(lines) + '\n'
+
+
+def build_notification(row: dict, mail_info: dict,
+                       whitelist_url: str, blacklist_url: str,
+                       pmg_url: str, cfg) -> MIMEMultipart:
+    """Собирает MIME-письмо уведомления."""
+
+
+    ttl_days     = cfg.getint('tokens', 'ttl_days', fallback=7)
+    mail_from    = cfg.get('notifications', 'mail_from',
+                           fallback='Proxmox Mail Gateway <postmaster@localhost>')
+    body_percent = cfg.getint('notifications', 'body_percent', fallback=100)
+
+    attachments    = mail_info.get('attachments', [])
+    body_html_safe = mail_info.get('body_html_safe', '') or ''
+    body_text      = mail_info.get('body_text', '')      or ''
+
+    # Применяем процент отображения
+    body_html_safe, body_text = _apply_body_percent(
+        body_html_safe, body_text, body_percent
+    )
+
+    body_html_safe = body_html_safe or '(нет текстового содержимого)'
+    body_text      = body_text      or '(нет текстового содержимого)'
+    body_label     = 'Текст письма (извлечён из HTML)' if mail_info.get('has_html_only') \
+                     else 'Текст письма'
+
+    ctx_html = {
+        'from_addr':        html_module.escape(mail_info['from']),
+        'to_addr':          html_module.escape(row['pmail']),
+        'subject':          html_module.escape(mail_info['subject']),
+        'date':             html_module.escape(mail_info['date']),
+        'spamlevel':        row['spamlevel'],
+        'body_html_safe':   body_html_safe,
+        'body_label':       body_label,
+        'attachments_block': _build_attachments_block(attachments),
+        'whitelist_url':    whitelist_url,
+        'blacklist_url':    blacklist_url,
+        'quarantine_id':    html_module.escape(row['quarantine_id']),
+        'ttl_days':         ttl_days,
+        'pmg_url':          pmg_url,
+    }
+
+    ctx_text = {
+        'from_addr':        mail_info['from'],
+        'to_addr':          row['pmail'],
+        'subject':          mail_info['subject'],
+        'date':             mail_info['date'],
+        'spamlevel':        row['spamlevel'],
+        'body_text':        body_text,
+        'attachments_text': _build_attachments_text(attachments),
+        'whitelist_url':    whitelist_url,
+        'blacklist_url':    blacklist_url,
+        'quarantine_id':    row['quarantine_id'],
+        'ttl_days':         ttl_days,
+        'pmg_url':          pmg_url,
+    }
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = _encode_header(f"[Карантин] {mail_info['subject']} — от {mail_info['from']}")
+    msg['From']    = _encode_address(mail_from)
+    msg['To']      = row['pmail']
+    msg['X-PMG-Quarantine-ID'] = row['quarantine_id']
+
+    msg.attach(MIMEText(TEXT_TEMPLATE.format(**ctx_text), 'plain', 'utf-8'))
+    msg.attach(MIMEText(HTML_TEMPLATE.format(**ctx_html),  'html',  'utf-8'))
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# Отправка через SMTP
+# ---------------------------------------------------------------------------
+
+def send_notification(msg: MIMEMultipart, recipient: str, cfg, log):
+    smtp_host = cfg.get('smtp', 'host', fallback='127.0.0.1')
+    smtp_port = cfg.getint('smtp', 'port', fallback=25)
+    smtp_user = cfg.get('smtp', 'user', fallback='')
+    smtp_pass = cfg.get('smtp', 'password', fallback='')
+    smtp_tls  = cfg.getboolean('smtp', 'starttls', fallback=False)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
+            s.ehlo()
+            if smtp_tls:
+                s.starttls()
+                s.ehlo()
+            if smtp_user and smtp_pass:
+                s.login(smtp_user, smtp_pass)
+            s.sendmail(msg['From'], [recipient], msg.as_bytes())
+        log.info("Notification sent to %s for %s", recipient, msg['X-PMG-Quarantine-ID'])
+    except Exception as e:
+        log.error("Failed to send notification to %s: %s", recipient, e)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Основной цикл
+# ---------------------------------------------------------------------------
+
+def main():
+    cfg = load_config()
+    log_level = cfg.get('general', 'log_level', fallback='INFO')
+    log = setup_logging('notifier', log_level)
+
+    secret = load_secret()
+    ttl_days = cfg.getint('tokens', 'ttl_days', fallback=7)
+
+    action_server_url = cfg.get('action_server', 'public_url').rstrip('/')
+    pmg_spool = cfg.get('pmg', 'spool_dir', fallback=PMG_SPOOL)
+
+    state = open_state_db()
+    cleanup_expired(state)
+
+    log.info("Scanning PMG quarantine for new entries...")
+
+    try:
+        rows = get_pending_quarantine(cfg)
+    except Exception as e:
+        log.error("Cannot query PMG DB: %s", e)
+        sys.exit(1)
+
+    log.info("Found %d pending quarantine entries", len(rows))
+
+    sent = 0
+    skipped = 0
+    errors = 0
+
+    for row in rows:
+        qid = row['quarantine_id']
+
+        if is_notified(state, qid):
+            skipped += 1
+            continue
+
+        # Путь к файлу в spool
+        filepath = os.path.join(pmg_spool, row['file'])
+        if not os.path.exists(filepath):
+            log.warning("Quarantine file not found, skipping %s: %s", qid, filepath)
+            skipped += 1
+            continue
+
+        # Парсим письмо
+        mail_info = parse_quarantine_file(filepath)
+
+        # Генерируем токены (разные для whitelist и blacklist)
+        wl_token = generate_token(qid, row['pmail'], secret, ttl_days)
+        bl_token = generate_token(qid + ":bl", row['pmail'], secret, ttl_days)
+
+        whitelist_url = f"{action_server_url}/action?token={wl_token}&action=whitelist"
+        blacklist_url = f"{action_server_url}/action?token={bl_token}&action=blacklist"
+
+        # Генерируем авто-авторизационную ссылку на карантин PMG
+        pmg_url = get_pmg_quarantine_url(row['pmail'], cfg, log)
+
+        # Собираем и отправляем уведомление
+        msg = build_notification(row, mail_info, whitelist_url, blacklist_url,
+                                 pmg_url, cfg)
+        recipient = row['receiver'] or row['pmail']
+
+        try:
+            send_notification(msg, recipient, cfg, log)
+            mark_notified(state, qid, row['pmail'], ttl_days)
+            sent += 1
+        except Exception:
+            errors += 1
+
+    state.close()
+    log.info("Done. Sent: %d, Skipped: %d, Errors: %d", sent, skipped, errors)
+
+    if errors:
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

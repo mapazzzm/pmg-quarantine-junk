@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""
+pmg-quarantine-action-server — HTTPS-сервер обработки нажатий кнопок.
+
+Принимает GET /action?token=<token>&action=whitelist|blacklist
+Проверяет токен, вызывает pmg-quarantine-do-action, возвращает HTML-ответ.
+
+Запускается как systemd-сервис.
+"""
+
+import html
+import logging
+import os
+import ssl
+import subprocess
+import sys
+
+from flask import Flask, request, Response
+
+sys.path.insert(0, '/usr/local/lib/pmg-quarantine-junk')
+from common import (
+    load_config, load_secret, setup_logging,
+    validate_token, open_state_db, is_token_used, mark_token_used
+)
+
+app = Flask(__name__)
+
+# Глобальные переменные, инициализируются в main()
+cfg    = None
+secret = None
+log    = None
+state  = None
+
+ACTION_BINARY = '/usr/local/bin/pmg-quarantine-do-action'
+
+# ---------------------------------------------------------------------------
+# HTML-шаблоны ответов
+# ---------------------------------------------------------------------------
+
+_BASE = """\
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{
+      margin: 0; padding: 0; background: #f0f2f5;
+      font-family: Arial, Helvetica, sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh;
+    }}
+    .card {{
+      background: #fff; border-radius: 12px; padding: 48px 40px;
+      max-width: 480px; width: 100%; text-align: center;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.12);
+    }}
+    .icon {{ font-size: 64px; margin-bottom: 16px; }}
+    h1 {{ margin: 0 0 12px; font-size: 22px; color: {color}; }}
+    p  {{ color: #555; font-size: 15px; line-height: 1.6; margin: 0; }}
+    .detail {{ margin-top: 24px; font-size: 12px; color: #bbb; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">{icon}</div>
+    <h1>{title}</h1>
+    <p>{message}</p>
+    {detail}
+  </div>
+</body>
+</html>
+"""
+
+
+def page_ok(action: str, quarantine_id: str) -> str:
+    if action == 'whitelist':
+        return _BASE.format(
+            icon='&#9989;',
+            title='Письмо доставлено',
+            color='#27ae60',
+            message='Письмо перемещено из карантина в ваш почтовый ящик.<br>'
+                    'Отправитель добавлен в белый список — следующие письма '
+                    'от него будут доставляться автоматически.',
+            detail=f'<p class="detail">ID: {html.escape(quarantine_id)}</p>',
+        )
+    else:
+        return _BASE.format(
+            icon='&#128683;',
+            title='Письмо заблокировано',
+            color='#e74c3c',
+            message='Письмо удалено из карантина.<br>'
+                    'Отправитель добавлен в чёрный список — его будущие письма '
+                    'будут автоматически отклоняться.',
+            detail=f'<p class="detail">ID: {html.escape(quarantine_id)}</p>',
+        )
+
+
+def page_error(reason: str) -> str:
+    return _BASE.format(
+        icon='&#9888;&#65039;',
+        title='Не удалось выполнить действие',
+        color='#e74c3c',
+        message=html.escape(reason),
+        detail='',
+    )
+
+
+def page_already_done() -> str:
+    return _BASE.format(
+        icon='&#8987;',
+        title='Действие уже выполнено',
+        color='#f39c12',
+        message='Это письмо уже было обработано ранее (через эту ссылку '
+                'или в интерфейсе карантина PMG).',
+        detail='',
+    )
+
+
+def page_expired() -> str:
+    return _BASE.format(
+        icon='&#128336;',
+        title='Ссылка устарела',
+        color='#95a5a6',
+        message='Срок действия ссылки истёк. Войдите в карантин PMG '
+                'для управления этим письмом.',
+        detail='',
+    )
+
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+@app.route('/action')
+def action():
+    token  = request.args.get('token', '').strip()
+    action = request.args.get('action', '').strip()
+
+    # Базовые проверки
+    if not token or not action:
+        return Response(page_error('Отсутствуют обязательные параметры.'),
+                        status=400, mimetype='text/html')
+
+    if action not in ('whitelist', 'blacklist'):
+        return Response(page_error('Недопустимое действие.'),
+                        status=400, mimetype='text/html')
+
+    # Валидация токена
+    try:
+        # Для blacklist токен содержит суффикс ":bl" в quarantine_id
+        suffix = ':bl' if action == 'blacklist' else ''
+        qid_with_suffix, pmail = validate_token(token, secret)
+        expected_suffix = ':bl' if action == 'blacklist' else ''
+        if not qid_with_suffix.endswith(expected_suffix):
+            raise ValueError("Token action mismatch")
+        quarantine_id = qid_with_suffix[:-len(':bl')] if expected_suffix else qid_with_suffix
+    except ValueError as e:
+        err = str(e)
+        log.warning("Token validation failed (action=%s): %s", action, err)
+        if 'expired' in err.lower():
+            return Response(page_expired(), status=410, mimetype='text/html')
+        return Response(page_error('Недействительная или повреждённая ссылка.'),
+                        status=403, mimetype='text/html')
+
+    # Защита от повторного использования
+    if is_token_used(state, token):
+        log.info("Token already used: qid=%s action=%s pmail=%s",
+                 quarantine_id, action, pmail)
+        return Response(page_already_done(), status=200, mimetype='text/html')
+
+    # Вызов Perl-скрипта
+    try:
+        result = subprocess.run(
+            [ACTION_BINARY, quarantine_id, action],
+            capture_output=True, text=True, timeout=30
+        )
+        output = result.stdout.strip()
+        log.info("do-action %s %s => rc=%d %s",
+                 quarantine_id, action, result.returncode, output)
+
+        if result.returncode == 0:
+            status_line = output.split('\n')[0] if output else ''
+
+            if status_line.startswith('ALREADY_PROCESSED'):
+                # Письмо уже обработали через PMG UI — засчитываем как успех
+                mark_token_used(state, token, action)
+                return Response(page_already_done(), status=200, mimetype='text/html')
+
+            if status_line.startswith('NOTFOUND'):
+                return Response(
+                    page_error('Письмо не найдено в карантине. '
+                               'Возможно, оно уже было удалено автоматически.'),
+                    status=404, mimetype='text/html'
+                )
+
+            mark_token_used(state, token, action)
+            return Response(page_ok(action, quarantine_id),
+                            status=200, mimetype='text/html')
+
+        else:
+            err_out = (result.stderr or result.stdout or 'unknown error').strip()
+            log.error("do-action failed: %s", err_out)
+            return Response(
+                page_error('Ошибка при выполнении действия. '
+                           'Попробуйте через интерфейс карантина PMG.'),
+                status=500, mimetype='text/html'
+            )
+
+    except subprocess.TimeoutExpired:
+        log.error("do-action timed out for %s", quarantine_id)
+        return Response(page_error('Превышено время ожидания. Попробуйте ещё раз.'),
+                        status=504, mimetype='text/html')
+    except FileNotFoundError:
+        log.error("Binary not found: %s", ACTION_BINARY)
+        return Response(page_error('Внутренняя ошибка конфигурации сервера.'),
+                        status=500, mimetype='text/html')
+
+
+@app.route('/health')
+def health():
+    return Response('OK', mimetype='text/plain')
+
+
+# ---------------------------------------------------------------------------
+# Запуск
+# ---------------------------------------------------------------------------
+
+def main():
+    global cfg, secret, log, state
+
+    cfg    = load_config()
+    log    = setup_logging('action-server',
+                           cfg.get('general', 'log_level', fallback='INFO'))
+    secret = load_secret()
+    state  = open_state_db()
+
+    host = cfg.get('action_server', 'bind_host', fallback='0.0.0.0')
+    port = cfg.getint('action_server', 'port', fallback=8765)
+
+    cert_file = cfg.get('action_server', 'ssl_cert',
+                        fallback='/etc/pmg/pmg-api.pem')
+    key_file  = cfg.get('action_server', 'ssl_key',
+                        fallback='/etc/pmg/pmg-api.pem')
+
+    use_ssl = cfg.getboolean('action_server', 'ssl', fallback=True)
+
+    log.info("Starting action server on %s:%d (SSL=%s)", host, port, use_ssl)
+
+    if use_ssl:
+        if not os.path.exists(cert_file):
+            log.error("SSL cert not found: %s", cert_file)
+            sys.exit(1)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert_file, key_file if key_file != cert_file else None)
+        app.run(host=host, port=port, ssl_context=ctx, debug=False)
+    else:
+        log.warning("SSL disabled — use only behind a trusted reverse proxy!")
+        app.run(host=host, port=port, debug=False)
+
+
+if __name__ == '__main__':
+    main()

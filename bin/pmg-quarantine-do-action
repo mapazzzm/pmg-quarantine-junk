@@ -1,0 +1,107 @@
+#!/usr/bin/perl
+# pmg-quarantine-do-action — выполняет действие над письмом в карантине PMG
+# Использует PMG Perl-модули напрямую (без HTTP API, т.к. API-токены не реализованы в PMG).
+#
+# Использование: pmg-quarantine-do-action <id> <action>
+#   id     — формат C{cid}R{rid}T{ticketid}
+#   action — whitelist | blacklist | deliver | delete
+
+use strict;
+use warnings;
+
+use PMG::DBTools;
+use PMG::Quarantine;
+use PMG::Utils qw(try_decode_utf8);
+
+# ---------------------------------------------------------------------------
+# Аргументы
+# ---------------------------------------------------------------------------
+
+die "Usage: $0 <quarantine_id> <action>\n"
+    unless @ARGV == 2;
+
+my ($id, $action) = @ARGV;
+
+die "Invalid action '$action'. Must be: whitelist|blacklist|deliver|delete\n"
+    unless $action =~ /^(whitelist|blacklist|deliver|delete)$/;
+
+die "Invalid quarantine ID '$id'. Expected format: C<n>R<n>T<n>\n"
+    unless $id =~ /^C(\d+)R(\d+)T(\d+)$/;
+
+my ($cid, $rid, $ticketid) = ($1 + 0, $2 + 0, $3 + 0);
+
+# ---------------------------------------------------------------------------
+# Открываем БД PMG
+# ---------------------------------------------------------------------------
+
+my $dbh = eval { PMG::DBTools::open_ruledb() };
+die "Cannot open PMG rule DB: $@\n" if $@;
+
+# ---------------------------------------------------------------------------
+# Получаем запись о письме
+# ---------------------------------------------------------------------------
+
+my $sth = $dbh->prepare(
+    "SELECT C.cid, C.rid, C.sender, C.file, C.spamlevel,
+            R.receiver, R.pmail, R.ticketid, R.status
+     FROM   CMailStore C
+     JOIN   CMSReceivers R
+            ON  C.cid = R.cmailstore_cid
+            AND C.rid = R.cmailstore_rid
+     WHERE  C.cid = ? AND C.rid = ? AND R.ticketid = ?"
+);
+
+$sth->execute($cid, $rid, $ticketid)
+    or die "DB query failed: " . $dbh->errstr . "\n";
+
+my $ref = $sth->fetchrow_hashref();
+$sth->finish();
+
+unless ($ref) {
+    print "NOTFOUND: quarantine entry $id does not exist\n";
+    exit 2;
+}
+
+# Уже обработано — не ошибка, просто сообщаем
+if ($ref->{status} ne 'N') {
+    print "ALREADY_PROCESSED: status=$ref->{status}\n";
+    exit 0;
+}
+
+my $sender   = try_decode_utf8($ref->{sender}   // '');
+my $pmail    = try_decode_utf8($ref->{pmail}    // '');
+my $receiver = try_decode_utf8($ref->{receiver} // $ref->{pmail} // '');
+
+# ---------------------------------------------------------------------------
+# Выполняем действие
+# ---------------------------------------------------------------------------
+
+eval {
+    if ($action eq 'whitelist') {
+        PMG::Quarantine::add_to_blackwhite($dbh, $pmail, 'WL', [$sender]);
+        PMG::Quarantine::deliver_quarantined_mail($dbh, $ref, $receiver);
+        print "OK: sender '$sender' added to whitelist for '$pmail', mail delivered\n";
+
+    } elsif ($action eq 'blacklist') {
+        PMG::Quarantine::add_to_blackwhite($dbh, $pmail, 'BL', [$sender]);
+        PMG::Quarantine::delete_quarantined_mail($dbh, $ref);
+        print "OK: sender '$sender' added to blacklist for '$pmail', mail deleted\n";
+
+    } elsif ($action eq 'deliver') {
+        PMG::Quarantine::deliver_quarantined_mail($dbh, $ref, $receiver);
+        print "OK: mail delivered to '$receiver'\n";
+
+    } elsif ($action eq 'delete') {
+        PMG::Quarantine::delete_quarantined_mail($dbh, $ref);
+        print "OK: mail deleted from quarantine\n";
+    }
+};
+
+if ($@) {
+    print "ERROR: $@\n";
+    $dbh->disconnect();
+    exit 1;
+}
+
+$dbh->disconnect();
+exit 0;

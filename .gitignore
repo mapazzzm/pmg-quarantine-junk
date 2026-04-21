@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Конфиг с реальными данными (в репо только .example)
+config/config.ini
+
+# Секреты и состояние — никогда не публиковать
+secret.key
+*.key
+state.db
+
+# Логи
+*.log
+
+# Редакторы
+.idea/
+.vscode/
+*.swp
+*~
