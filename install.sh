@@ -253,6 +253,12 @@ else
     ok "Пользователь pmg-quarantine уже существует"
 fi
 
+# SSL-сертификат PMG принадлежит группе www-data — добавляем pmg-quarantine в неё
+if getent group www-data &>/dev/null; then
+    usermod -aG www-data pmg-quarantine
+    ok "pmg-quarantine добавлен в группу www-data (доступ к SSL-сертификату PMG)"
+fi
+
 for dir in "$INSTALL_LIB" "$INSTALL_ETC" "$INSTALL_VAR"; do
     mkdir -p "$dir"
     ok "Директория: $dir"
