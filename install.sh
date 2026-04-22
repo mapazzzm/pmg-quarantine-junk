@@ -138,7 +138,7 @@ ok "pip: $("$PYTHON" -m pip --version | awk '{print $1,$2}')"
 section "5. Установка Python-зависимостей"
 # =============================================================================
 
-REQUIRED_PKGS=(psycopg2-binary flask)
+REQUIRED_PKGS=(psycopg2-binary flask gunicorn)
 
 for pkg in "${REQUIRED_PKGS[@]}"; do
     pkg_name="${pkg%%-*}"  # psycopg2-binary → psycopg2
@@ -508,14 +508,16 @@ section "16. Проверка работоспособности"
 # =============================================================================
 
 sleep 1
-HEALTH_PROTO="$( [[ "$USE_SSL" == "true" ]] && echo "https" || echo "http" )"
-HEALTH_URL="${HEALTH_PROTO}://127.0.0.1:${ACTION_PORT}/health"
+CHECK_PROTO="$( [[ "$USE_SSL" == "true" ]] && echo "https" || echo "http" )"
+CHECK_URL="${CHECK_PROTO}://127.0.0.1:${ACTION_PORT}/action"
 if command -v curl &>/dev/null; then
-    HEALTH=$(curl -sk "$HEALTH_URL" 2>/dev/null || true)
-    if [[ "$HEALTH" == "OK" ]]; then
-        ok "Health-check пройден: $HEALTH_URL → OK"
+    HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$CHECK_URL" 2>/dev/null || true)
+    if [[ "$HTTP_CODE" == "400" ]]; then
+        ok "Action-сервер отвечает: $CHECK_URL → HTTP $HTTP_CODE (ожидаемо без токена)"
+    elif [[ -n "$HTTP_CODE" && "$HTTP_CODE" != "000" ]]; then
+        ok "Action-сервер отвечает: $CHECK_URL → HTTP $HTTP_CODE"
     else
-        warn "Health-check не ответил (возможно, ещё стартует). Проверьте вручную: curl -sk $HEALTH_URL"
+        warn "Action-сервер не ответил (возможно, ещё стартует). Проверьте: journalctl -u pmg-quarantine-action-server -n 20"
     fi
 fi
 

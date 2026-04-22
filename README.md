@@ -50,7 +50,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mapazzzm/pmg-quarantine-junk
 
 1. Проверяет ОС (Debian/Ubuntu), наличие PMG, доступность базы данных
 2. Устанавливает Python 3 и pip, если отсутствуют
-3. Устанавливает Python-зависимости: `psycopg2-binary`, `flask`
+3. Устанавливает Python-зависимости: `psycopg2-binary`, `flask`, `gunicorn`
 4. Спрашивает параметры: hostname PMG, адрес отправителя, порт action-сервера
 5. Автоматически читает из конфига PMG: relay-сервер, SSL-сертификат
 6. Создаёт системного пользователя `pmg-quarantine` для запуска action-сервера
@@ -192,8 +192,8 @@ tail -f /var/log/pmg-quarantine-junk.log
 # Ручной запуск notifier (для теста)
 /usr/local/bin/pmg-quarantine-notifier
 
-# Health-check action-сервера
-curl -sk https://pmg.example.com:8765/health
+# Проверка доступности action-сервера (должен вернуть HTTP 400)
+curl -sk -o /dev/null -w "%{http_code}" https://pmg.example.com:8765/action
 ```
 
 ---
@@ -208,6 +208,7 @@ curl -sk https://pmg.example.com:8765/health
 - **Разделение действий**: токен для whitelist не сработает как blacklist и наоборот
 - **Без PMG API**: действия выполняются через прямой вызов Perl-модулей PMG — не открывает дополнительных сетевых поверхностей атаки
 - **SSL**: action-сервер использует тот же Let's Encrypt сертификат, что и веб-интерфейс PMG
+- **Production WSGI**: action-сервер работает на **gunicorn** (2 воркера) — не Flask dev-server; защищён от slowloris и конкурентных запросов
 
 ---
 

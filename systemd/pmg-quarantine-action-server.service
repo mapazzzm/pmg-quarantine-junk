@@ -19,7 +19,8 @@ SyslogIdentifier=pmg-quarantine-action-server
 # Ограничения безопасности
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/pmg-quarantine-junk /var/log /run
+ReadWritePaths=/var/lib/pmg-quarantine-junk /var/log /run /tmp
+WorkingDirectory=/tmp
 ReadOnlyPaths=/etc/pmg-quarantine-junk /etc/pmg /usr/local/lib/pmg-quarantine-junk
 
 [Install]

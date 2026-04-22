@@ -11,10 +11,10 @@ pmg-quarantine-action-server — HTTPS-сервер обработки нажа�
 import html
 import logging
 import os
-import ssl
 import subprocess
 import sys
 
+import gunicorn.app.base
 from flask import Flask, request, Response
 
 sys.path.insert(0, '/usr/local/lib/pmg-quarantine-junk')
@@ -250,11 +250,6 @@ def action():
                         status=500, mimetype='text/html')
 
 
-@app.route('/health')
-def health():
-    return Response('OK', mimetype='text/plain')
-
-
 # ---------------------------------------------------------------------------
 # Запуск
 # ---------------------------------------------------------------------------
@@ -280,16 +275,42 @@ def main():
 
     log.info("Starting action server on %s:%d (SSL=%s)", host, port, use_ssl)
 
+    options = {
+        'bind': f'{host}:{port}',
+        'workers': 2,
+        'timeout': 30,
+        'loglevel': 'warning',
+        'accesslog': '-',
+        'errorlog': '-',
+        'worker_tmp_dir': '/tmp',
+        'control_socket_disable': True,
+    }
+
     if use_ssl:
         if not os.path.exists(cert_file):
             log.error("SSL cert not found: %s", cert_file)
             sys.exit(1)
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(cert_file, key_file if key_file != cert_file else None)
-        app.run(host=host, port=port, ssl_context=ctx, debug=False)
+        options['certfile'] = cert_file
+        if key_file != cert_file:
+            options['keyfile'] = key_file
     else:
         log.warning("SSL disabled — use only behind a trusted reverse proxy!")
-        app.run(host=host, port=port, debug=False)
+
+    class _App(gunicorn.app.base.BaseApplication):
+        def __init__(self, application, opts):
+            self.options = opts
+            self.application = application
+            super().__init__()
+
+        def load_config(self):
+            for key, value in self.options.items():
+                if key in self.cfg.settings and value is not None:
+                    self.cfg.set(key.lower(), value)
+
+        def load(self):
+            return self.application
+
+    _App(app, options).run()
 
 
 if __name__ == '__main__':
