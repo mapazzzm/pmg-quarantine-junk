@@ -138,6 +138,8 @@ def page_error(reason: str) -> str:
 
 
 def page_already_done() -> str:
+    autoclose = _AUTOCLOSE_BLOCK.format(delay=_AUTOCLOSE_DELAY)
+    script    = _AUTOCLOSE_SCRIPT.format(delay=_AUTOCLOSE_DELAY)
     return _BASE.format(
         icon='&#8987;',
         title='Действие уже выполнено',
@@ -145,8 +147,8 @@ def page_already_done() -> str:
         message='Это письмо уже было обработано ранее (через эту ссылку '
                 'или в интерфейсе карантина PMG).',
         detail='',
-        autoclose='',
-        script='',
+        autoclose=autoclose,
+        script=script,
     )
 
 
