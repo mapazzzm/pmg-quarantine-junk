@@ -76,6 +76,7 @@ def get_pending_quarantine(cfg):
         port=cfg.get('pmg', 'db_port', fallback='5432'),
         cursor_factory=psycopg2.extras.RealDictCursor
     )
+    conn.set_client_encoding('UTF8')
     cur = conn.cursor()
     cur.execute("""
         SELECT
@@ -711,7 +712,8 @@ def send_notification(msg: MIMEMultipart, recipient: str, cfg, log):
                 s.ehlo()
             if smtp_user and smtp_pass:
                 s.login(smtp_user, smtp_pass)
-            s.sendmail(msg['From'], [recipient], msg.as_bytes())
+            _, from_email = email.utils.parseaddr(msg['From'])
+            s.sendmail(from_email, [recipient], msg.as_bytes())
         log.info("Notification sent to %s for %s", recipient, msg['X-PMG-Quarantine-ID'])
     except Exception as e:
         log.error("Failed to send notification to %s: %s", recipient, e)
