@@ -178,6 +178,11 @@ ok "SMTP relay из конфига PMG: $MAIL_HOST:$MAIL_PORT"
 
 # Адрес отправителя уведомлений (имя < адрес >)
 default_postmaster="Антиспам-сервер <postmaster@${PMG_HOSTNAME#*.}>"
+echo
+warn "Адрес отправителя должен быть реальным и принятым вашим почтовым сервером."
+info "Почтовый сервер может отклонить письмо с ошибкой '5.7.1 Sender address rejected',"
+info "если адрес не существует или не разрешён политиками SMTP (smtpd_sender_restrictions)."
+info "Используйте адрес, который ваш сервер точно пропустит — например, noreply@ваш-домен.com"
 read -rp "  Имя и e-mail отправителя уведомлений [$default_postmaster]: " MAIL_FROM
 MAIL_FROM="${MAIL_FROM:-$default_postmaster}"
 
