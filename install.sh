@@ -402,7 +402,7 @@ cat > "$CRON_FILE" <<EOF
 # Запускается каждые ${CRON_INTERVAL} мин. — сканирует карантин, отправляет уведомления
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-${CRON_SCHEDULE} root /usr/local/bin/pmg-quarantine-notifier >> /var/log/pmg-quarantine-junk.log 2>&1
+${CRON_SCHEDULE} root flock -n /run/pmg-quarantine-notifier.lock /usr/local/bin/pmg-quarantine-notifier >> /var/log/pmg-quarantine-junk.log 2>&1
 EOF
 
 ok "Cron: $CRON_FILE (каждые $CRON_INTERVAL мин.)"
