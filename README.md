@@ -195,8 +195,17 @@ systemctl status pmg-quarantine-action-server
 journalctl -u pmg-quarantine-action-server -f
 tail -f /var/log/pmg-quarantine-junk.log
 
-# Ручной запуск notifier (для теста)
+# Ручной запуск notifier (для теста — все пользователи)
 /usr/local/bin/pmg-quarantine-notifier
+
+# Обработать карантин только для одного пользователя
+/usr/local/bin/pmg-quarantine-notifier --pmail user@example.com
+
+# Обработать не более N писем за один запуск (удобно при большом бэклоге)
+/usr/local/bin/pmg-quarantine-notifier --limit 50
+
+# Комбинация: только один пользователь, не более 50 писем
+/usr/local/bin/pmg-quarantine-notifier --pmail user@example.com --limit 50
 
 # Проверка доступности action-сервера (должен вернуть HTTP 400)
 curl -sk -o /dev/null -w "%{http_code}" https://pmg.example.com:8765/action
