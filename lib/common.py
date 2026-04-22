@@ -25,6 +25,7 @@ STATE_DB    = '/var/lib/pmg-quarantine-junk/state.db'
 LOG_FILE    = '/var/log/pmg-quarantine-junk.log'
 
 def load_config(path=CONFIG_PATH):
+    _fix_ownership(path, user='pmg-quarantine', mode=0o640)
     cfg = configparser.ConfigParser()
     if not cfg.read(path):
         raise FileNotFoundError(f"Config not found: {path}")
@@ -38,19 +39,23 @@ def load_secret(path=SECRET_PATH):
 # Logging
 # ---------------------------------------------------------------------------
 
-def _fix_log_ownership(path: str):
-    """Устанавливает владельца лог-файла pmg-quarantine:pmg-quarantine 640.
-    Нужно при создании файла от root — иначе action-server (pmg-quarantine) не сможет писать.
+def _fix_ownership(path: str, user: str = 'pmg-quarantine', mode: int = 0o640):
+    """Устанавливает владельца файла root:<user> и права <mode>.
     Ошибки игнорируются: если нет прав или пользователь не существует — не страшно."""
     try:
-        pw = pwd.getpwnam('pmg-quarantine')
+        pw = pwd.getpwnam(user)
         st = os.stat(path)
-        if st.st_uid != pw.pw_uid or st.st_gid != pw.pw_gid:
-            os.chown(path, pw.pw_uid, pw.pw_gid)
-        if stat.S_IMODE(st.st_mode) != 0o640:
-            os.chmod(path, 0o640)
+        if st.st_uid != 0 or st.st_gid != pw.pw_gid:
+            os.chown(path, 0, pw.pw_gid)
+        if stat.S_IMODE(st.st_mode) != mode:
+            os.chmod(path, mode)
     except (KeyError, PermissionError, OSError):
         pass
+
+
+def _fix_log_ownership(path: str):
+    """Обратная совместимость — делегирует в _fix_ownership."""
+    _fix_ownership(path, user='pmg-quarantine', mode=0o640)
 
 
 def setup_logging(name: str, level: str = 'INFO') -> logging.Logger:

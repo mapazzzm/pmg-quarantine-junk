@@ -245,14 +245,6 @@ pip3 uninstall bleach tinycss2 webencodings -y
 
 ## Диагностика и известные особенности
 
-### Права на /etc/pmg-quarantine-junk/config.ini
-
-Файл должен принадлежать `root:pmg-quarantine` с правами `640`. Если конфиг был отредактирован инструментом, который пересоздаёт файл (например, некоторые текстовые редакторы), группа может сброситься на `root`, и нотифайер перестанет его видеть. Восстановить:
-
-```bash
-chown root:pmg-quarantine /etc/pmg-quarantine-junk/config.ini
-```
-
 ### Нотифайер запускается от root (cron)
 
 `pmg-quarantine-notifier` в cron работает от `root` — это необходимо для подключения к PostgreSQL через peer-аутентификацию (`db_user = root`). Action-сервер при этом работает от `pmg-quarantine`.
