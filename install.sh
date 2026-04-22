@@ -302,7 +302,7 @@ if [[ -f "$SECRET_FILE" ]]; then
     warn "Если хотите перегенерировать — удалите файл и запустите установку повторно."
     warn "ВНИМАНИЕ: старые ссылки в уже отправленных письмах перестанут работать!"
 else
-    python3 -c "import secrets; open('$SECRET_FILE','w').write(secrets.token_hex(64))"
+    "$PYTHON" -c "import secrets; open('$SECRET_FILE','w').write(secrets.token_hex(64))"
     chown root:pmg-quarantine "$SECRET_FILE"
     chmod 640 "$SECRET_FILE"
     ok "HMAC-секрет сгенерирован: $SECRET_FILE"
