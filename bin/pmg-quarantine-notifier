@@ -216,6 +216,19 @@ def _human_size(n: int) -> str:
     return f"{n} ГБ"
 
 
+def _iter_parts(msg):
+    """Обходит MIME-части, не рекурсируя внутрь message/rfc822 — они обрабатываются отдельно."""
+    if msg.get_content_type() == 'message/rfc822':
+        yield msg
+        return
+    if msg.is_multipart():
+        yield msg
+        for part in msg.get_payload():
+            yield from _iter_parts(part)
+    else:
+        yield msg
+
+
 def _extract_fwd_parts(inner_msg) -> tuple:
     """Извлекает text/plain и text/html из вложенного message/rfc822."""
     plain, html = [], []
@@ -275,7 +288,7 @@ def parse_quarantine_file(filepath: str) -> dict:
         html_parts  = []
         attachments = []
 
-        parts = list(msg.walk()) if msg.is_multipart() else [msg]
+        parts = list(_iter_parts(msg))
 
         for part in parts:
             ct   = part.get_content_type()
