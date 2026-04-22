@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -T
 # pmg-quarantine-gen-ticket — генерирует авто-авторизационную ссылку на карантин PMG.
 # Использует тот же механизм, что и встроенные отчёты PMG (RSA-тикет).
 #
@@ -8,14 +8,27 @@
 use strict;
 use warnings;
 
+# Taint mode: очищаем окружение до загрузки модулей
+BEGIN {
+    $ENV{PATH} = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+    delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+}
+
 use PMG::Ticket;
 use PMG::Config;
 use URI::Escape;
 
-my $pmail = $ARGV[0] or die "Usage: $0 <pmail>\n";
+my $raw_pmail = $ARGV[0] or die "Usage: $0 <pmail>\n";
 
-my $ticket   = PMG::Ticket::assemble_quarantine_ticket($pmail);
-my $esc      = uri_escape($ticket);
+# Валидация и untaint: захваченная группа снимает taint
+my ($pmail) = $raw_pmail =~ /\A([^@\s]+\@[^@\s]+\.[^@\s]+)\z/
+    or die "Invalid email address: $raw_pmail\n";
+
+my $ticket = eval { PMG::Ticket::assemble_quarantine_ticket($pmail) };
+die "Failed to generate ticket: $@\n" if $@;
+die "Empty ticket returned for $pmail\n" unless defined($ticket) && length($ticket);
+
+my $esc = uri_escape($ticket);
 
 my $cfg      = PMG::Config->new();
 my $hostname = $cfg->get('spamquar', 'hostname') // do {

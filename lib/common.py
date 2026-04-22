@@ -5,10 +5,11 @@ Token generation/validation, config loading, logging setup.
 
 import base64
 import configparser
-import hmac
 import hashlib
+import hmac
 import logging
 import os
+import re
 import sqlite3
 import time
 
@@ -93,7 +94,6 @@ def validate_token(token: str, secret: bytes) -> tuple:
     if int(expiry_str) < int(time.time()):
         raise ValueError("Token has expired")
 
-    import re
     if not re.match(r'^C\d+R\d+T\d+(:bl)?$', quarantine_id):
         raise ValueError("Invalid quarantine ID in token")
 
@@ -135,10 +135,10 @@ def is_notified(conn: sqlite3.Connection, quarantine_id: str) -> bool:
 
 def mark_notified(conn: sqlite3.Connection, quarantine_id: str,
                   pmail: str, ttl_days: int = 7):
-    expiry = int(time.time()) + ttl_days * 86400
+    now = int(time.time())
     conn.execute(
         "INSERT OR REPLACE INTO notified VALUES (?,?,?,?)",
-        (quarantine_id, pmail, int(time.time()), expiry)
+        (quarantine_id, pmail, now, now + ttl_days * 86400)
     )
     conn.commit()
 

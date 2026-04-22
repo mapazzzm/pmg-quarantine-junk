@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -T
 # pmg-quarantine-do-action — выполняет действие над письмом в карантине PMG
 # Использует PMG Perl-модули напрямую (без HTTP API, т.к. API-токены не реализованы в PMG).
 #
@@ -8,6 +8,12 @@
 
 use strict;
 use warnings;
+
+# Taint mode: очищаем окружение до загрузки модулей
+BEGIN {
+    $ENV{PATH} = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+    delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+}
 
 use PMG::DBTools;
 use PMG::Quarantine;
@@ -24,11 +30,12 @@ my ($id, $action) = @ARGV;
 
 die "Invalid action '$action'. Must be: whitelist|blacklist|deliver|delete\n"
     unless $action =~ /^(whitelist|blacklist|deliver|delete)$/;
+$action = $1;  # untaint
 
 die "Invalid quarantine ID '$id'. Expected format: C<n>R<n>T<n>\n"
     unless $id =~ /^C(\d+)R(\d+)T(\d+)$/;
 
-my ($cid, $rid, $ticketid) = ($1 + 0, $2 + 0, $3 + 0);
+my ($cid, $rid, $ticketid) = ($1 + 0, $2 + 0, $3 + 0);  # +0 untaints числа
 
 # ---------------------------------------------------------------------------
 # Открываем БД PMG

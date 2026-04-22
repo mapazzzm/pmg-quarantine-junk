@@ -186,7 +186,6 @@ def action():
     # Валидация токена
     try:
         # Для blacklist токен содержит суффикс ":bl" в quarantine_id
-        suffix = ':bl' if action == 'blacklist' else ''
         qid_with_suffix, pmail = validate_token(token, secret)
         expected_suffix = ':bl' if action == 'blacklist' else ''
         if not qid_with_suffix.endswith(expected_suffix):

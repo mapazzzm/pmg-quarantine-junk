@@ -116,9 +116,11 @@ if ! "$PYTHON" -m pip --version &>/dev/null 2>&1; then
     if apt-get install -y python3-pip &>/dev/null 2>&1; then
         ok "pip установлен через apt"
     else
-        # Fallback: get-pip.py
-        info "Загружаем get-pip.py..."
-        TMP_PIP=$(mktemp)
+        # Fallback: get-pip.py (apt недоступен или не содержит python3-pip)
+        warn "apt не смог установить python3-pip — загружаем get-pip.py с bootstrap.pypa.io."
+        warn "Файл выполняется без проверки контрольной суммы. Нажмите Ctrl+C, если это неприемлемо."
+        sleep 3
+        TMP_PIP=$(mktemp --suffix=.py)
         if command -v curl &>/dev/null; then
             curl -sSL https://bootstrap.pypa.io/get-pip.py -o "$TMP_PIP"
         elif command -v wget &>/dev/null; then
@@ -138,10 +140,11 @@ ok "pip: $("$PYTHON" -m pip --version | awk '{print $1,$2}')"
 section "5. Установка Python-зависимостей"
 # =============================================================================
 
-REQUIRED_PKGS=(psycopg2-binary flask gunicorn bleach tinycss2)
+REQUIRED_PKGS=(psycopg2-binary flask gunicorn "bleach>=6.2.0" tinycss2)
 
 for pkg in "${REQUIRED_PKGS[@]}"; do
-    pkg_name="${pkg%%-*}"  # psycopg2-binary → psycopg2
+    pkg_name="${pkg%%[>=<!]*}"  # bleach>=6.2.0 → bleach
+    pkg_name="${pkg_name%%-*}"  # psycopg2-binary → psycopg2
     if "$PYTHON" -c "import ${pkg_name//-/_}" &>/dev/null 2>&1; then
         ok "Python-пакет уже установлен: $pkg"
     else
@@ -204,8 +207,11 @@ fi
 # Процент отображения тела письма
 read -rp "  Показывать тело письма в уведомлении, % (0=нет, 100=полностью) [100]: " BODY_PERCENT
 BODY_PERCENT="${BODY_PERCENT:-100}"
-if ! [[ "$BODY_PERCENT" =~ ^[0-9]+$ ]] || [[ "$BODY_PERCENT" -gt 100 ]]; then
+if ! [[ "$BODY_PERCENT" =~ ^[0-9]+$ ]]; then
     warn "Некорректное значение '$BODY_PERCENT', используем 100"
+    BODY_PERCENT=100
+elif [[ "$BODY_PERCENT" -gt 100 ]]; then
+    warn "Значение '$BODY_PERCENT' > 100, обрезаем до 100"
     BODY_PERCENT=100
 fi
 
