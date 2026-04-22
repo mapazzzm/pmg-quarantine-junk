@@ -78,7 +78,7 @@ Cron (*/5 минут)
 
 Пользователь нажимает кнопку в письме
   └─► HTTPS GET https://pmg.example.com:8765/action?token=...
-        └─► pmg-quarantine-action-server (Flask, systemd)
+        └─► pmg-quarantine-action-server (gunicorn + Flask, systemd)
               ├─ Проверяет HMAC-подпись и срок действия токена
               ├─ Проверяет, не использован ли токен повторно (SQLite)
               ├─ Вызывает pmg-quarantine-do-action <id> <whitelist|blacklist>
