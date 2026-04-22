@@ -9,8 +9,10 @@ import hashlib
 import hmac
 import logging
 import os
+import pwd
 import re
 import sqlite3
+import stat
 import time
 
 # ---------------------------------------------------------------------------
@@ -36,11 +38,27 @@ def load_secret(path=SECRET_PATH):
 # Logging
 # ---------------------------------------------------------------------------
 
+def _fix_log_ownership(path: str):
+    """Устанавливает владельца лог-файла pmg-quarantine:pmg-quarantine 640.
+    Нужно при создании файла от root — иначе action-server (pmg-quarantine) не сможет писать.
+    Ошибки игнорируются: если нет прав или пользователь не существует — не страшно."""
+    try:
+        pw = pwd.getpwnam('pmg-quarantine')
+        st = os.stat(path)
+        if st.st_uid != pw.pw_uid or st.st_gid != pw.pw_gid:
+            os.chown(path, pw.pw_uid, pw.pw_gid)
+        if stat.S_IMODE(st.st_mode) != 0o640:
+            os.chmod(path, 0o640)
+    except (KeyError, PermissionError, OSError):
+        pass
+
+
 def setup_logging(name: str, level: str = 'INFO') -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     if not logger.handlers:
         fh = logging.FileHandler(LOG_FILE)
+        _fix_log_ownership(LOG_FILE)
         fh.setFormatter(logging.Formatter(
             '%(asctime)s %(name)s [%(levelname)s] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
