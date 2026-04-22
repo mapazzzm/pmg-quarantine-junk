@@ -8,6 +8,7 @@ Wants=network.target
 Type=simple
 User=pmg-quarantine
 Group=pmg-quarantine
+ExecStartPre=+/bin/sh -c 'touch /var/log/pmg-quarantine-junk.log && chown pmg-quarantine:pmg-quarantine /var/log/pmg-quarantine-junk.log && chmod 640 /var/log/pmg-quarantine-junk.log'
 ExecStart=/usr/local/bin/pmg-quarantine-action-server
 Restart=on-failure
 RestartSec=10
