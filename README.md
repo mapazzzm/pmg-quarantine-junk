@@ -232,6 +232,12 @@ bash uninstall.sh
 rm -rf /etc/pmg-quarantine-junk /var/lib/pmg-quarantine-junk /var/log/pmg-quarantine-junk.log
 ```
 
+Python-зависимости (`bleach`, `tinycss2` и др.) скрипт не удаляет — они могут использоваться другими программами. Если хотите удалить вручную:
+
+```bash
+pip3 uninstall bleach tinycss2 webencodings -y
+```
+
 ---
 
 ## Лицензия
