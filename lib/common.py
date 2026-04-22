@@ -97,6 +97,9 @@ def validate_token(token: str, secret: bytes) -> tuple:
     if not re.match(r'^C\d+R\d+T\d+(:bl)?$', quarantine_id):
         raise ValueError("Invalid quarantine ID in token")
 
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', pmail):
+        raise ValueError("Invalid email in token")
+
     return quarantine_id, pmail
 
 # ---------------------------------------------------------------------------

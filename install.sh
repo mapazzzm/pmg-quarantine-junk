@@ -138,7 +138,7 @@ ok "pip: $("$PYTHON" -m pip --version | awk '{print $1,$2}')"
 section "5. Установка Python-зависимостей"
 # =============================================================================
 
-REQUIRED_PKGS=(psycopg2-binary flask gunicorn)
+REQUIRED_PKGS=(psycopg2-binary flask gunicorn bleach tinycss2)
 
 for pkg in "${REQUIRED_PKGS[@]}"; do
     pkg_name="${pkg%%-*}"  # psycopg2-binary → psycopg2
@@ -302,15 +302,15 @@ fi
 section "9. Установка файлов"
 # =============================================================================
 
-# Библиотека
-cp "$SCRIPT_DIR/lib/common.py" "$INSTALL_LIB/common.py"
+# Библиотека — 640 root:pmg-quarantine
+install -m 640 -o root -g pmg-quarantine "$SCRIPT_DIR/lib/common.py" "$INSTALL_LIB/common.py"
 ok "Библиотека: $INSTALL_LIB/common.py"
 
-# Бинарники
-install -m 755 "$SCRIPT_DIR/bin/pmg-quarantine-do-action"     "$INSTALL_BIN/"
-install -m 755 "$SCRIPT_DIR/bin/pmg-quarantine-notifier"      "$INSTALL_BIN/"
-install -m 755 "$SCRIPT_DIR/bin/pmg-quarantine-action-server" "$INSTALL_BIN/"
-install -m 755 "$SCRIPT_DIR/bin/pmg-quarantine-gen-ticket"    "$INSTALL_BIN/"
+# Бинарники — 750 root:pmg-quarantine (читают только root и сервисный пользователь)
+install -m 750 -o root -g pmg-quarantine "$SCRIPT_DIR/bin/pmg-quarantine-do-action"     "$INSTALL_BIN/"
+install -m 750 -o root -g pmg-quarantine "$SCRIPT_DIR/bin/pmg-quarantine-notifier"      "$INSTALL_BIN/"
+install -m 750 -o root -g pmg-quarantine "$SCRIPT_DIR/bin/pmg-quarantine-action-server" "$INSTALL_BIN/"
+install -m 750 -o root -g pmg-quarantine "$SCRIPT_DIR/bin/pmg-quarantine-gen-ticket"    "$INSTALL_BIN/"
 ok "Исполняемые файлы установлены в $INSTALL_BIN/"
 
 # Systemd unit
@@ -411,33 +411,63 @@ chmod 440 "$SUDOERS_FILE"
 ok "Sudoers: $SUDOERS_FILE"
 
 # =============================================================================
-section "13. Firewall (локальный)"
+section "13. Firewall (локальный) + rate limiting"
 # =============================================================================
 
-if command -v iptables &>/dev/null; then
-    # Проверяем, не открыт ли уже порт
+RATE_LIMIT=30   # максимум новых соединений в минуту с одного IP на порт action-сервера
+
+if command -v nft &>/dev/null; then
+    NFT_CONF=/etc/nftables.conf
+
+    # Добавляем правило rate limiting если его ещё нет
+    if ! nft list ruleset 2>/dev/null | grep -q "port${ACTION_PORT}_limit"; then
+        # Создаём таблицу/цепочку если нет, иначе только добавляем правило
+        if ! nft list table inet filter &>/dev/null 2>&1; then
+            nft add table inet filter
+            nft add chain inet filter input '{ type filter hook input priority filter; }'
+        fi
+        nft add rule inet filter input \
+            tcp dport "$ACTION_PORT" ct state new \
+            meter "port${ACTION_PORT}_limit" \
+            "{ ip saddr limit rate over ${RATE_LIMIT}/minute }" drop
+        ok "nftables rate limiting: порт $ACTION_PORT — макс. $RATE_LIMIT новых соединений/мин с одного IP"
+    else
+        ok "nftables rate limiting для порта $ACTION_PORT уже настроен"
+    fi
+
+    # Сохраняем в /etc/nftables.conf
+    if [[ -f "$NFT_CONF" ]]; then
+        # Вставляем правило в секцию chain input если файл существует
+        if ! grep -q "port${ACTION_PORT}_limit" "$NFT_CONF"; then
+            sed -i "/chain input {/a\\\\t\\ttcp dport ${ACTION_PORT} ct state new meter port${ACTION_PORT}_limit { ip saddr limit rate over ${RATE_LIMIT}/minute } drop" "$NFT_CONF"
+            ok "Правило rate limiting добавлено в $NFT_CONF"
+        fi
+        systemctl enable nftables &>/dev/null || true
+        ok "nftables включён в автозапуск"
+    else
+        warn "Файл $NFT_CONF не найден — правило активно до перезагрузки."
+        warn "Добавьте вручную в конфиг nftables:"
+        warn "  tcp dport $ACTION_PORT ct state new meter port${ACTION_PORT}_limit { ip saddr limit rate over ${RATE_LIMIT}/minute } drop"
+    fi
+
+elif command -v iptables &>/dev/null; then
+    # Fallback: iptables (для систем без nftables)
     if iptables -C INPUT -p tcp --dport "$ACTION_PORT" -j ACCEPT &>/dev/null 2>&1; then
         ok "Порт $ACTION_PORT уже открыт в iptables"
     else
-        iptables -I INPUT -p tcp --dport "$ACTION_PORT" -j ACCEPT
-        ok "Порт $ACTION_PORT открыт в iptables (текущая сессия)"
+        iptables -A INPUT -p tcp --dport "$ACTION_PORT" -m state --state NEW \
+            -m recent --set
+        iptables -A INPUT -p tcp --dport "$ACTION_PORT" -m state --state NEW \
+            -m recent --update --seconds 60 --hitcount "$RATE_LIMIT" -j DROP
+        ok "iptables rate limiting: порт $ACTION_PORT — макс. $RATE_LIMIT соединений/мин с одного IP"
 
-        # Сохраняем постоянно
-        if command -v iptables-save &>/dev/null; then
-            if [[ -f /etc/iptables/rules.v4 ]]; then
-                iptables-save > /etc/iptables/rules.v4
-                ok "Правило сохранено в /etc/iptables/rules.v4"
-            elif [[ -f /etc/iptables.rules ]]; then
-                iptables-save > /etc/iptables.rules
-                ok "Правило сохранено в /etc/iptables.rules"
-            else
-                warn "Не нашли файл для сохранения iptables-правил."
-                warn "Добавьте вручную: iptables -I INPUT -p tcp --dport $ACTION_PORT -j ACCEPT"
-            fi
+        if command -v iptables-save &>/dev/null && [[ -f /etc/iptables/rules.v4 ]]; then
+            iptables-save > /etc/iptables/rules.v4
+            ok "Правила сохранены в /etc/iptables/rules.v4"
         fi
     fi
 else
-    warn "iptables не найден. Убедитесь, что порт $ACTION_PORT открыт вручную."
+    warn "ни nftables, ни iptables не найдены. Убедитесь, что порт $ACTION_PORT открыт вручную."
 fi
 
 # =============================================================================

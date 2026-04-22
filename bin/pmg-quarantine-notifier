@@ -122,96 +122,52 @@ def decode_mime_header(value: str) -> str:
     return ' '.join(decoded)
 
 
-from html.parser import HTMLParser as _HTMLParser
+import bleach
+from bleach.css_sanitizer import CSSSanitizer
 
+_CSS_SANITIZER = CSSSanitizer(allowed_css_properties=[
+    'color', 'background', 'background-color',
+    'font', 'font-size', 'font-family', 'font-weight', 'font-style',
+    'text-align', 'text-decoration', 'text-transform', 'text-indent',
+    'margin', 'margin-top', 'margin-bottom', 'margin-left', 'margin-right',
+    'padding', 'padding-top', 'padding-bottom', 'padding-left', 'padding-right',
+    'border', 'border-top', 'border-bottom', 'border-left', 'border-right',
+    'border-collapse', 'border-spacing', 'border-radius',
+    'width', 'height', 'max-width', 'min-width', 'line-height',
+    'display', 'vertical-align', 'white-space', 'word-break',
+    'float', 'clear',
+])
 
-class _HTMLSanitizer(_HTMLParser):
-    """
-    Санитайзер HTML для вставки тела письма в уведомление.
+_ALLOWED_TAGS = [
+    'p', 'br', 'div', 'span', 'table', 'tr', 'td', 'th', 'thead', 'tbody', 'tfoot',
+    'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'b', 'i', 'u', 's', 'strong', 'em', 'small', 'big', 'sub', 'sup', 'mark',
+    'blockquote', 'pre', 'code', 'hr', 'font', 'center',
+]
 
-    Оставляет: всё визуальное форматирование (теги, inline-стили, классы).
-    Удаляет целиком (включая содержимое): <style>, <script>, <head>.
-    Удаляет тег, но оставляет текст внутри: <a> (ссылки становятся обычным текстом).
-    Удаляет без следа: <img>, <link>, <meta>, <base>.
-    Нейтрализует: href/src/action/on* атрибуты во всех тегах.
-    """
-
-    _SKIP_WITH_CONTENT = frozenset({'style', 'script', 'head'})
-    _VOID_REMOVE       = frozenset({'img', 'link', 'meta', 'base', 'input'})
-    _STRIP_TAG_ONLY    = frozenset({'a'})          # тег убираем, текст внутри оставляем
-    _UNSAFE_ATTRS      = frozenset({               # атрибуты, которые убираем
-        'href', 'src', 'action', 'formaction', 'xlink:href',
-        'onclick', 'onload', 'onerror', 'onmouseover', 'onmouseout',
-        'onfocus', 'onblur', 'onsubmit', 'onchange',
-    })
-
-    def __init__(self):
-        super().__init__(convert_charrefs=False)
-        self._out   = []
-        self._depth = 0      # глубина вложенности в _SKIP_WITH_CONTENT
-
-    def handle_starttag(self, tag, attrs):
-        if self._depth:
-            self._depth += 1
-            return
-        if tag in self._SKIP_WITH_CONTENT:
-            self._depth = 1
-            return
-        if tag in self._VOID_REMOVE:
-            return
-        if tag in self._STRIP_TAG_ONLY:
-            return   # текст внутри <a>...</a> попадёт через handle_data
-        # Безопасный тег — фильтруем атрибуты
-        safe = [(k, v) for k, v in attrs
-                if k.lower() not in self._UNSAFE_ATTRS]
-        if safe:
-            attrs_str = ' '.join(
-                f'{k}="{v}"' if v is not None else k
-                for k, v in safe
-            )
-            self._out.append(f'<{tag} {attrs_str}>')
-        else:
-            self._out.append(f'<{tag}>')
-
-    def handle_endtag(self, tag):
-        if self._depth:
-            self._depth -= 1
-            return
-        if tag in self._SKIP_WITH_CONTENT | self._VOID_REMOVE | self._STRIP_TAG_ONLY:
-            return
-        self._out.append(f'</{tag}>')
-
-    def handle_data(self, data):
-        if self._depth:
-            return
-        self._out.append(data)
-
-    def handle_entityref(self, name):
-        if not self._depth:
-            self._out.append(f'&{name};')
-
-    def handle_charref(self, name):
-        if not self._depth:
-            self._out.append(f'&#{name};')
-
-    def get_output(self) -> str:
-        return ''.join(self._out)
+_ALLOWED_ATTRS = {
+    '*': ['style', 'class', 'id', 'align', 'valign', 'width', 'height',
+          'bgcolor', 'color', 'border', 'cellpadding', 'cellspacing'],
+}
 
 
 def _sanitize_html(raw_html: str) -> str:
     """
     Возвращает очищенный HTML: форматирование сохранено, ссылки/трекеры удалены.
-    Если есть <body>, санитизируем только его содержимое — это надёжнее,
-    чем парсить весь документ с <head> и MSO-комментариями.
+    Использует bleach (Mozilla) вместо самописного парсера.
     """
-    # Вырезаем содержимое <body>...</body> если оно есть
     m = re.search(r'<body[^>]*>(.*)</body>', raw_html,
                   flags=re.DOTALL | re.IGNORECASE)
     content = m.group(1) if m else raw_html
 
-    p = _HTMLSanitizer()
-    p.feed(content)
-    return p.get_output()
+    return bleach.clean(
+        content,
+        tags=_ALLOWED_TAGS,
+        attributes=_ALLOWED_ATTRS,
+        css_sanitizer=_CSS_SANITIZER,
+        strip=True,
+    )
 
 
 def _apply_body_percent(html_body: str, text_body: str,
@@ -636,15 +592,15 @@ def build_notification(row: dict, mail_info: dict,
         'to_addr':          html_module.escape(row['pmail']),
         'subject':          html_module.escape(mail_info['subject']),
         'date':             html_module.escape(mail_info['date']),
-        'spamlevel':        row['spamlevel'],
+        'spamlevel':        html_module.escape(str(row['spamlevel'])),
         'body_html_safe':   body_html_safe,
         'body_label':       body_label,
         'attachments_block': _build_attachments_block(attachments),
-        'whitelist_url':    whitelist_url,
-        'blacklist_url':    blacklist_url,
+        'whitelist_url':    html_module.escape(whitelist_url),
+        'blacklist_url':    html_module.escape(blacklist_url),
         'quarantine_id':    html_module.escape(row['quarantine_id']),
         'ttl_days':         ttl_days,
-        'pmg_url':          pmg_url,
+        'pmg_url':          html_module.escape(pmg_url),
     }
 
     ctx_text = {
