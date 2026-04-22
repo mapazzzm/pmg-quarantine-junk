@@ -272,6 +272,10 @@ for dir in "$INSTALL_LIB" "$INSTALL_ETC" "$INSTALL_VAR"; do
     ok "Директория: $dir"
 done
 
+# VAR-директория должна принадлежать pmg-quarantine: SQLite создаёт там journal-файлы
+chown pmg-quarantine:pmg-quarantine "$INSTALL_VAR"
+chmod 750 "$INSTALL_VAR"
+
 # state.db — создаём заранее с правильным владельцем
 touch "$INSTALL_VAR/state.db"
 chown pmg-quarantine:pmg-quarantine "$INSTALL_VAR/state.db"
@@ -392,7 +396,7 @@ cat > "$CRON_FILE" <<EOF
 # Запускается каждые ${CRON_INTERVAL} мин. — сканирует карантин, отправляет уведомления
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-${CRON_SCHEDULE} root /usr/local/bin/pmg-quarantine-notifier >> /var/log/pmg-quarantine-junk.log 2>&1
+${CRON_SCHEDULE} pmg-quarantine /usr/local/bin/pmg-quarantine-notifier >> /var/log/pmg-quarantine-junk.log 2>&1
 EOF
 
 ok "Cron: $CRON_FILE (каждые $CRON_INTERVAL мин.)"
