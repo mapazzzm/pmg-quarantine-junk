@@ -216,6 +216,29 @@ def _human_size(n: int) -> str:
     return f"{n} ГБ"
 
 
+def _extract_fwd_parts(inner_msg) -> tuple:
+    """Извлекает text/plain и text/html из вложенного message/rfc822."""
+    plain, html = [], []
+    parts = list(inner_msg.walk()) if inner_msg.is_multipart() else [inner_msg]
+    for p in parts:
+        ct   = p.get_content_type()
+        disp = (p.get('Content-Disposition') or '').lower()
+        fname = decode_mime_header(p.get_filename() or '')
+        if fname or 'attachment' in disp:
+            continue
+        if ct == 'text/plain':
+            payload = p.get_payload(decode=True)
+            if payload:
+                cs = p.get_content_charset('utf-8') or 'utf-8'
+                plain.append(payload.decode(cs, errors='replace'))
+        elif ct == 'text/html':
+            payload = p.get_payload(decode=True)
+            if payload:
+                cs = p.get_content_charset('utf-8') or 'utf-8'
+                html.append(payload.decode(cs, errors='replace'))
+    return plain, html
+
+
 def parse_quarantine_file(filepath: str) -> dict:
     """
     Разбирает .eml из карантина.
@@ -283,6 +306,23 @@ def parse_quarantine_file(filepath: str) -> dict:
                     charset = part.get_content_charset('utf-8') or 'utf-8'
                     html_parts.append(payload.decode(charset, errors='replace'))
 
+            elif ct == 'message/rfc822' and 'attachment' not in disp:
+                # Пересланное письмо (inline forward) — извлекаем текст из вложенного сообщения
+                inner_msgs = part.get_payload()
+                if isinstance(inner_msgs, list) and inner_msgs:
+                    fwd_plain, fwd_html = _extract_fwd_parts(inner_msgs[0])
+                    if fwd_plain:
+                        plain_parts.append(
+                            '\n--- Пересланное письмо ---\n' + '\n'.join(fwd_plain)
+                        )
+                    if fwd_html:
+                        html_parts.append(
+                            '<div style="margin:8px 0 0;padding:8px 12px;'
+                            'border-left:3px solid #ccc;color:#555;">'
+                            + '\n'.join(fwd_html)
+                            + '</div>'
+                        )
+
         # --- HTML-версия тела (для HTML-части письма уведомления) ---
         if html_parts:
             # Санитизируем: убираем скрипты/стили/ссылки, форматирование сохраняем
@@ -290,6 +330,8 @@ def parse_quarantine_file(filepath: str) -> dict:
             # Убираем невидимые spacer-символы
             sanitized = re.sub(r'\u2800+', ' ', sanitized)
             sanitized = re.sub(r'[\u200b-\u200f\ufeff\u034f]+', '', sanitized)
+            # Убираем маркер пересылки — почтовые клиенты прячут блок за ним как цитату
+            sanitized = re.sub(r'-{5,}[^<\n]*?Forwarded message[^<\n]*?-{5,}<br\s*/?>', '', sanitized, flags=re.IGNORECASE)
             result['body_html_safe'] = sanitized
             result['has_html_only'] = not bool(plain_parts)
         elif plain_parts:
@@ -323,6 +365,8 @@ def parse_quarantine_file(filepath: str) -> dict:
         body = re.sub(r'[ \t]{4,}', ' ', body)
         body = re.sub(r'\n{3,}', '\n\n', body)
         body = re.sub(r'^[ \t\d]{0,5}$', '', body, flags=re.MULTILINE)
+        # Убираем маркер пересылки из plain-текста
+        body = re.sub(r'^-{5,}[^\n]*?Forwarded message[^\n]*?-{5,}\r?\n?', '', body, flags=re.MULTILINE | re.IGNORECASE)
         result['body_text'] = body.strip()
 
         result['attachments'] = attachments
@@ -583,6 +627,10 @@ def build_notification(row: dict, mail_info: dict,
     body_html_safe, body_text = _apply_body_percent(
         body_html_safe, body_text, body_percent, body_min_chars
     )
+
+    # Закрываем теги, оборванные обрезкой по проценту — иначе ломается шаблон письма
+    if body_html_safe:
+        body_html_safe = _CLEANER.clean(body_html_safe)
 
     body_html_safe = body_html_safe or '(нет текстового содержимого)'
     body_text      = body_text      or '(нет текстового содержимого)'
