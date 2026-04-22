@@ -58,6 +58,27 @@ done
 
 systemctl daemon-reload
 
+# Удаляем правило nftables rate limiting
+if command -v nft &>/dev/null; then
+    # Ищем правила с meter port*_limit и удаляем их
+    while IFS= read -r handle; do
+        nft delete rule inet filter input handle "$handle" 2>/dev/null && \
+            ok "Удалено nftables-правило rate limiting (handle $handle)" || true
+    done < <(nft -a list chain inet filter input 2>/dev/null | grep 'port.*_limit' | grep -oP 'handle \K\d+')
+
+    # Удаляем meter
+    for meter in $(nft list meters inet filter 2>/dev/null | grep -oP 'meter \K\S+_limit'); do
+        nft delete meter inet filter "$meter" 2>/dev/null && \
+            ok "Удалён nftables meter: $meter" || true
+    done
+
+    # Убираем правило из /etc/nftables.conf
+    if [[ -f /etc/nftables.conf ]] && grep -q '_limit' /etc/nftables.conf; then
+        sed -i '/_limit/d' /etc/nftables.conf
+        ok "Правило rate limiting удалено из /etc/nftables.conf"
+    fi
+fi
+
 # Удаляем системного пользователя
 if id pmg-quarantine &>/dev/null; then
     deluser --system pmg-quarantine 2>/dev/null || true
