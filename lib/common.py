@@ -69,9 +69,6 @@ def setup_logging(name: str, level: str = 'INFO') -> logging.Logger:
             datefmt='%Y-%m-%d %H:%M:%S'
         ))
         logger.addHandler(fh)
-        sh = logging.StreamHandler()
-        sh.setFormatter(logging.Formatter('%(name)s [%(levelname)s] %(message)s'))
-        logger.addHandler(sh)
     return logger
 
 # ---------------------------------------------------------------------------
