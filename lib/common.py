@@ -40,7 +40,7 @@ def load_secret(path=SECRET_PATH):
 # ---------------------------------------------------------------------------
 
 def _fix_ownership(path: str, user: str = 'pmg-quarantine', mode: int = 0o640):
-    """Устанавливает владельца файла root:<user> и права <mode>.
+    """Устанавливает владельца файла root:<group> и права <mode>.
     Ошибки игнорируются: если нет прав или пользователь не существует — не страшно."""
     try:
         pw = pwd.getpwnam(user)
