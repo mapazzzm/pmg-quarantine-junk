@@ -749,6 +749,9 @@ def main():
     action_server_url = cfg.get('action_server', 'public_url').rstrip('/')
     pmg_spool = cfg.get('pmg', 'spool_dir', fallback=PMG_SPOOL)
 
+    exclude_raw = cfg.get('notifications', 'exclude_addresses', fallback='')
+    excluded = {a.strip().lower() for a in exclude_raw.split(',') if a.strip()}
+
     state = open_state_db()
     cleanup_expired(state)
 
@@ -775,6 +778,11 @@ def main():
 
     for row in rows:
         qid = row['quarantine_id']
+
+        if excluded and row['pmail'].lower() in excluded:
+            log.debug("Skipping excluded address: %s (%s)", row['pmail'], qid)
+            skipped += 1
+            continue
 
         if is_notified(state, qid):
             skipped += 1
