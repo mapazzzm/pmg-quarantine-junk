@@ -77,16 +77,15 @@ def get_pending_quarantine(cfg, pmail_filter=None):
         port=cfg.get('pmg', 'db_port', fallback='5432'),
         cursor_factory=psycopg2.extras.RealDictCursor
     )
-    conn.set_client_encoding('UTF8')
+    # LATIN1 принимает любой байт (SQL_ASCII база содержит cp1251/latin1 данные)
+    conn.set_client_encoding('LATIN1')
     cur = conn.cursor()
     query = """
         SELECT
             C.cid,
             C.rid,
-            C.sender,
             C.file,
             C.spamlevel,
-            C.header,
             C.time::text AS time_str,
             R.pmail,
             R.receiver,
@@ -158,6 +157,28 @@ def decode_mime_header(value: str) -> str:
 import bleach
 from bleach.css_sanitizer import CSSSanitizer
 from bleach.sanitizer import Cleaner
+
+# Маскировка явных URL в теле превью
+_URL_RE = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
+_URL_MASK_HTML = '<span style="color:#aaa;font-style:italic">[ссылка скрыта]</span>'
+_URL_MASK_TEXT = '[ссылка скрыта]'
+
+
+def _mask_urls_html(html: str) -> str:
+    """Заменяет явные URL в текстовых узлах HTML (не внутри тегов) на заглушку."""
+    parts = re.split(r'(<[^>]+>)', html)
+    result = []
+    for part in parts:
+        if part.startswith('<'):
+            result.append(part)
+        else:
+            result.append(_URL_RE.sub(_URL_MASK_HTML, part))
+    return ''.join(result)
+
+
+def _mask_urls_text(text: str) -> str:
+    """Заменяет явные URL в plain-тексте на заглушку."""
+    return _URL_RE.sub(_URL_MASK_TEXT, text)
 
 _CSS_SANITIZER = CSSSanitizer(allowed_css_properties=[
     'color', 'background', 'background-color',
@@ -416,6 +437,10 @@ def parse_quarantine_file(filepath: str) -> dict:
         result['body_text'] = body.strip()
 
         result['attachments'] = attachments
+
+        # Маскируем явные URL в превью, чтобы пользователь не мог скопировать и открыть
+        result['body_html_safe'] = _mask_urls_html(result['body_html_safe'])
+        result['body_text']      = _mask_urls_text(result['body_text'])
 
     except Exception as e:
         result['body_text']      = f'(не удалось прочитать содержимое: {e})'
