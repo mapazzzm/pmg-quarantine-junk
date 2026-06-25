@@ -177,6 +177,16 @@ def try_use_token(conn: sqlite3.Connection, token: str, action: str) -> bool:
     conn.commit()
     return cursor.rowcount == 1
 
+def unuse_token(conn: sqlite3.Connection, token: str):
+    """
+    Откатывает пометку токена как использованного.
+    Вызывается, если действие не было выполнено (ошибка/таймаут do-action),
+    чтобы пользователь мог повторить попытку по той же ссылке.
+    """
+    h = hashlib.sha256(token.encode()).hexdigest()
+    conn.execute("DELETE FROM used_tokens WHERE token_hash=?", (h,))
+    conn.commit()
+
 def cleanup_expired(conn: sqlite3.Connection):
     now = int(time.time())
     conn.execute("DELETE FROM notified WHERE token_expiry < ?", (now,))

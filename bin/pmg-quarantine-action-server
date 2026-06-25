@@ -20,7 +20,7 @@ from flask import Flask, request, Response
 sys.path.insert(0, '/usr/local/lib/pmg-quarantine-junk')
 from common import (
     load_config, load_secret, setup_logging,
-    validate_token, open_state_db, try_use_token
+    validate_token, open_state_db, try_use_token, unuse_token
 )
 
 app = Flask(__name__)
@@ -223,6 +223,8 @@ def action():
                 return Response(page_already_done(), status=200, mimetype='text/html')
 
             if status_line.startswith('NOTFOUND'):
+                # Действие не выполнено — откатываем токен, чтобы не блокировать повтор
+                unuse_token(state, token)
                 return Response(
                     page_error('Письмо не найдено в карантине. '
                                'Возможно, оно уже было удалено автоматически.'),
@@ -233,6 +235,8 @@ def action():
                             status=200, mimetype='text/html')
 
         else:
+            # Действие не выполнено — откатываем токен, чтобы пользователь мог повторить
+            unuse_token(state, token)
             err_out = (result.stderr or result.stdout or 'unknown error').strip()
             log.error("do-action failed: %s", err_out)
             return Response(
@@ -242,10 +246,12 @@ def action():
             )
 
     except subprocess.TimeoutExpired:
+        unuse_token(state, token)
         log.error("do-action timed out for %s", quarantine_id)
         return Response(page_error('Превышено время ожидания. Попробуйте ещё раз.'),
                         status=504, mimetype='text/html')
     except FileNotFoundError:
+        unuse_token(state, token)
         log.error("Binary not found: %s", ACTION_BINARY)
         return Response(page_error('Внутренняя ошибка конфигурации сервера.'),
                         status=500, mimetype='text/html')
