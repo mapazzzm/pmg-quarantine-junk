@@ -214,11 +214,49 @@ _CLEANER = Cleaner(
 )
 
 
+# Теги, которые нужно вырезать ВМЕСТЕ с содержимым: bleach удаляет только сам тег,
+# а текст внутри (CSS из <style>, код из <script>) оставляет и он попадает в превью.
+_RAW_BLOCK_RE = re.compile(
+    r'<(style|script|head|title|xml|noscript|template)\b[^>]*>.*?</\1\s*>',
+    flags=re.DOTALL | re.IGNORECASE)
+
+# Незакрытый блок (битый MIME, обрезанное письмо) — вырезаем до конца документа
+_RAW_BLOCK_TAIL_RE = re.compile(
+    r'<(style|script|head|title|xml)\b[^>]*>.*$',
+    flags=re.DOTALL | re.IGNORECASE)
+
+
+def _strip_raw_blocks(raw_html: str) -> str:
+    """Удаляет служебные блоки (style/script/head/...) вместе с их содержимым."""
+    cleaned = _RAW_BLOCK_RE.sub(' ', raw_html)
+    return _RAW_BLOCK_TAIL_RE.sub(' ', cleaned)
+
+
+# Простыни спейсеров preheader'а: &nbsp;/&#160;/NBSP/zero-width/Braille blank вперемешку
+# с обычными пробелами. Схлопываем серии, где есть минимум два таких спейсера.
+_SPACER = r'(?:&nbsp;|&#160;|&#xA0;|[ ​-‏⠀͏])'
+_SPACER_RUN_RE = re.compile(
+    rf'(?:{_SPACER}|[ \t\r\n])*{_SPACER}(?:{_SPACER}|[ \t\r\n])*{_SPACER}'
+    rf'(?:{_SPACER}|[ \t\r\n])*',
+    flags=re.IGNORECASE)
+
+
+def _collapse_spacers_html(html: str) -> str:
+    """Схлопывает простыни невидимых спейсеров в текстовых узлах HTML (не внутри тегов)."""
+    parts = re.split(r'(<[^>]+>)', html)
+    return ''.join(
+        part if part.startswith('<') else _SPACER_RUN_RE.sub(' ', part)
+        for part in parts
+    )
+
+
 def _sanitize_html(raw_html: str) -> str:
     """
     Возвращает очищенный HTML: форматирование сохранено, ссылки/трекеры удалены.
     Использует bleach (Mozilla) вместо самописного парсера.
     """
+    raw_html = _strip_raw_blocks(raw_html)
+
     m = re.search(r'<body[^>]*>(.*)</body>', raw_html,
                   flags=re.DOTALL | re.IGNORECASE)
     content = m.group(1) if m else raw_html
@@ -397,6 +435,8 @@ def parse_quarantine_file(filepath: str) -> dict:
             # Убираем невидимые spacer-символы
             sanitized = re.sub(r'\u2800+', ' ', sanitized)
             sanitized = re.sub(r'[\u200b-\u200f\ufeff\u034f]+', '', sanitized)
+            # Схлопываем простыни &nbsp;-спейсеров preheader'а (сотни подряд у рассылок)
+            sanitized = _collapse_spacers_html(sanitized)
             # Убираем маркер пересылки — почтовые клиенты прячут блок за ним как цитату
             sanitized = re.sub(r'-{5,}[^<\n]*?Forwarded message[^<\n]*?-{5,}<br\s*/?>', '', sanitized, flags=re.IGNORECASE)
             result['body_html_safe'] = sanitized
@@ -414,10 +454,7 @@ def parse_quarantine_file(filepath: str) -> dict:
         elif html_parts:
             # Из HTML выжимаем текст как запасной вариант
             raw = '\n'.join(html_parts)
-            body = re.sub(r'<style[^>]*>.*?</style>', '', raw,
-                          flags=re.DOTALL | re.IGNORECASE)
-            body = re.sub(r'<script[^>]*>.*?</script>', '', body,
-                          flags=re.DOTALL | re.IGNORECASE)
+            body = _strip_raw_blocks(raw)
             body = re.sub(r'<(?:br|p|div|tr|li|h[1-6])[^>]*>', '\n', body,
                           flags=re.IGNORECASE)
             body = re.sub(r'<[^>]+>', ' ', body)
