@@ -20,7 +20,8 @@ from flask import Flask, request, Response
 sys.path.insert(0, '/usr/local/lib/pmg-quarantine-junk')
 from common import (
     load_config, load_secret, setup_logging,
-    validate_token, open_state_db, try_use_token, unuse_token
+    validate_token, open_state_db, try_use_token, unuse_token,
+    get_notified_sender
 )
 
 app = Flask(__name__)
@@ -125,6 +126,24 @@ def page_ok(action: str, quarantine_id: str) -> str:
         )
 
 
+def page_sender_blocked(sender: str) -> str:
+    autoclose = _AUTOCLOSE_BLOCK.format(delay=_AUTOCLOSE_DELAY)
+    script    = _AUTOCLOSE_SCRIPT.format(delay=_AUTOCLOSE_DELAY)
+    return _BASE.format(
+        icon='&#128683;',
+        title='Отправитель заблокирован',
+        color='#e74c3c',
+        message='Самого письма в карантине уже нет — оно было удалено '
+                'автоматически по истечении срока хранения, получателю '
+                'не доставлено.<br>'
+                'Отправитель добавлен в чёрный список — его будущие письма '
+                'будут автоматически отклоняться.',
+        detail=f'<p class="detail">Отправитель: {html.escape(sender)}</p>',
+        autoclose=autoclose,
+        script=script,
+    )
+
+
 def page_error(reason: str) -> str:
     return _BASE.format(
         icon='&#9888;&#65039;',
@@ -226,6 +245,30 @@ def action():
             return Response(page_already_done(), status=200, mimetype='text/html')
 
         if status_line.startswith('NOTFOUND'):
+            # Письма в карантине уже нет (PMG удалил его по истечении lifetime).
+            # Для «Спам» намерение пользователя всё равно выполнимо: отправителя
+            # можно занести в чёрный список по адресу, сохранённому в state.db
+            # при отправке уведомления.
+            if action == 'blacklist':
+                sender = get_notified_sender(state, quarantine_id)
+                if sender:
+                    bl = subprocess.run(
+                        ['sudo', '-n', ACTION_BINARY,
+                         '--blacklist-sender', pmail, sender],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    log.info("orphan blacklist %s (%s) => rc=%d %s",
+                             sender, pmail, bl.returncode, bl.stdout.strip())
+                    if bl.returncode == 0:
+                        # Действие состоялось — токен не откатываем.
+                        return Response(page_sender_blocked(sender),
+                                        status=200, mimetype='text/html')
+                    log.error("orphan blacklist failed: %s",
+                              (bl.stderr or bl.stdout or 'unknown error').strip())
+                else:
+                    log.info("orphan blacklist skipped for %s: no sender in state.db",
+                             quarantine_id)
+
             # Действие не выполнено — откатываем токен, чтобы не блокировать повтор
             unuse_token(state, token)
             return Response(

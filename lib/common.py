@@ -134,9 +134,16 @@ def open_state_db(path=STATE_DB) -> sqlite3.Connection:
             quarantine_id TEXT PRIMARY KEY,
             pmail         TEXT NOT NULL,
             notified_at   INTEGER NOT NULL,
-            token_expiry  INTEGER NOT NULL
+            token_expiry  INTEGER NOT NULL,
+            sender        TEXT
         )
     """)
+    # Миграция БД, созданных до появления колонки sender.
+    # sender нужен, чтобы кнопка «Спам» могла добавить отправителя в чёрный
+    # список даже после того, как PMG удалил письмо из карантина по lifetime.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(notified)")}
+    if 'sender' not in cols:
+        conn.execute("ALTER TABLE notified ADD COLUMN sender TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS used_tokens (
             token_hash  TEXT PRIMARY KEY,
@@ -154,13 +161,28 @@ def is_notified(conn: sqlite3.Connection, quarantine_id: str) -> bool:
     return row is not None
 
 def mark_notified(conn: sqlite3.Connection, quarantine_id: str,
-                  pmail: str, ttl_days: int = 7):
+                  pmail: str, ttl_days: int = 7, sender: str = None):
     now = int(time.time())
+    # Колонки перечислены явно: у таблицы есть необязательный sender,
+    # и позиционный VALUES (?,?,?,?) сломался бы при его добавлении.
     conn.execute(
-        "INSERT OR REPLACE INTO notified VALUES (?,?,?,?)",
-        (quarantine_id, pmail, now, now + ttl_days * 86400)
+        "INSERT OR REPLACE INTO notified "
+        "(quarantine_id, pmail, notified_at, token_expiry, sender) "
+        "VALUES (?,?,?,?,?)",
+        (quarantine_id, pmail, now, now + ttl_days * 86400, sender)
     )
     conn.commit()
+
+def get_notified_sender(conn: sqlite3.Connection, quarantine_id: str):
+    """
+    Возвращает envelope-отправителя, сохранённого при отправке уведомления,
+    или None. Нужен для блокировки отправителя, когда самого письма
+    в карантине уже нет (удалено PMG по истечении lifetime).
+    """
+    row = conn.execute(
+        "SELECT sender FROM notified WHERE quarantine_id=?", (quarantine_id,)
+    ).fetchone()
+    return row[0] if row and row[0] else None
 
 def try_use_token(conn: sqlite3.Connection, token: str, action: str) -> bool:
     """

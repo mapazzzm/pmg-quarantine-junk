@@ -5,6 +5,10 @@
 # Использование: pmg-quarantine-do-action <id> <action>
 #   id     — формат C{cid}R{rid}T{ticketid}
 #   action — whitelist | blacklist | deliver | delete
+#
+#            pmg-quarantine-do-action --blacklist-sender <pmail> <sender>
+#   Добавляет отправителя в чёрный список без привязки к записи карантина —
+#   для случая, когда письмо уже удалено PMG по истечении lifetime.
 
 use strict;
 use warnings;
@@ -23,7 +27,42 @@ use PMG::Utils qw(try_decode_utf8);
 # Аргументы
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Режим --blacklist-sender: письма в карантине больше нет (удалено по
+# lifetime), но отправителя всё равно нужно заблокировать.
+# Оба адреса приходят из action-server: pmail — из подписанного HMAC-токена,
+# sender — из state.db (туда его записал нотифайер из БД PMG).
+# ---------------------------------------------------------------------------
+
+if (@ARGV == 3 && $ARGV[0] eq '--blacklist-sender') {
+    my (undef, $pmail_arg, $sender_arg) = @ARGV;
+
+    # Скобки обязательны: taint снимается ТОЛЬКО захватом подшаблона ($1),
+    # значение $& остаётся «грязным» и PMG-модули его отвергнут.
+    my $EMAIL_RE = qr/^([^\@\s<>"]+\@[^\@\s<>"]+\.[^\@\s<>"]+)$/;
+
+    die "Invalid pmail\n"  unless $pmail_arg  =~ $EMAIL_RE;
+    my $bw_pmail = $1;   # untaint
+    die "Invalid sender\n" unless $sender_arg =~ $EMAIL_RE;
+    my $bw_sender = $1;  # untaint
+
+    my $bw_dbh = eval { PMG::DBTools::open_ruledb() };
+    die "Cannot open PMG rule DB: $@\n" if $@;
+
+    eval { PMG::Quarantine::add_to_blackwhite($bw_dbh, $bw_pmail, 'BL', [$bw_sender]) };
+    if ($@) {
+        print "ERROR: $@\n";
+        $bw_dbh->disconnect();
+        exit 1;
+    }
+
+    print "OK: sender '$bw_sender' added to blacklist for '$bw_pmail' (no quarantine entry)\n";
+    $bw_dbh->disconnect();
+    exit 0;
+}
+
 die "Usage: $0 <quarantine_id> <action>\n"
+    . "       $0 --blacklist-sender <pmail> <sender>\n"
     unless @ARGV == 2;
 
 my ($id, $action) = @ARGV;

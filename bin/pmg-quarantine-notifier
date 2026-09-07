@@ -68,6 +68,21 @@ def get_pmg_quarantine_url(pmail: str, cfg, log) -> str:
 # PMG Database
 # ---------------------------------------------------------------------------
 
+_SENDER_RE = re.compile(r'^[^@\s<>"]+@[^@\s<>"]+\.[^@\s<>"]+$')
+
+def _clean_sender(sender) -> str:
+    """
+    Envelope-отправитель из БД PMG, пригодный для PMG::Quarantine::add_to_blackwhite.
+    Сохраняется в state.db, чтобы кнопка «Спам» работала и после удаления
+    письма из карантина. Всё, что не похоже на адрес (пустой <>, мусорные
+    байты SQL_ASCII), отбрасывается — блокировать такое нельзя.
+    """
+    if not sender:
+        return None
+    sender = sender.strip().strip('<>').lower()
+    return sender if _SENDER_RE.match(sender) else None
+
+
 def get_pending_quarantine(cfg, pmail_filter=None):
     """Возвращает список новых записей карантина типа 'spam', ещё не уведомлённых."""
     conn = psycopg2.connect(
@@ -78,12 +93,16 @@ def get_pending_quarantine(cfg, pmail_filter=None):
         cursor_factory=psycopg2.extras.RealDictCursor
     )
     # LATIN1 принимает любой байт (SQL_ASCII база содержит cp1251/latin1 данные)
+    # и потому никогда не падает на C.sender — в отличие от UTF8, из-за которого
+    # это поле когда-то убирали из запроса. Используется только как адрес
+    # (envelope sender) и перед употреблением проверяется регуляркой.
     conn.set_client_encoding('LATIN1')
     cur = conn.cursor()
     query = """
         SELECT
             C.cid,
             C.rid,
+            C.sender,
             C.file,
             C.spamlevel,
             C.time::text AS time_str,
@@ -902,7 +921,8 @@ def main():
 
         try:
             send_notification(msg, recipient, cfg, log)
-            mark_notified(state, qid, row['pmail'], ttl_days)
+            mark_notified(state, qid, row['pmail'], ttl_days,
+                          sender=_clean_sender(row.get('sender')))
             sent += 1
         except Exception:
             errors += 1
