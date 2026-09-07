@@ -215,22 +215,28 @@ def action():
         log.info("do-action %s %s => rc=%d %s",
                  quarantine_id, action, result.returncode, output)
 
+        # ВАЖНО: статус-строки проверяем ДО ветвления по returncode.
+        # do-action печатает NOTFOUND в stdout, но завершается с exit 2,
+        # поэтому раньше эта ветка была недостижима и пользователь видел
+        # общее «Ошибка при выполнении действия» вместо внятного текста.
+        status_line = output.split('\n')[0] if output else ''
+
+        if status_line.startswith('ALREADY_PROCESSED'):
+            # Письмо уже обработали через PMG UI — засчитываем как успех
+            return Response(page_already_done(), status=200, mimetype='text/html')
+
+        if status_line.startswith('NOTFOUND'):
+            # Действие не выполнено — откатываем токен, чтобы не блокировать повтор
+            unuse_token(state, token)
+            return Response(
+                page_error('Письмо больше не находится в карантине — оно было '
+                           'удалено автоматически по истечении срока хранения '
+                           '(10 дней). Получателю оно НЕ доставлено, '
+                           'никаких действий не требуется.'),
+                status=404, mimetype='text/html'
+            )
+
         if result.returncode == 0:
-            status_line = output.split('\n')[0] if output else ''
-
-            if status_line.startswith('ALREADY_PROCESSED'):
-                # Письмо уже обработали через PMG UI — засчитываем как успех
-                return Response(page_already_done(), status=200, mimetype='text/html')
-
-            if status_line.startswith('NOTFOUND'):
-                # Действие не выполнено — откатываем токен, чтобы не блокировать повтор
-                unuse_token(state, token)
-                return Response(
-                    page_error('Письмо не найдено в карантине. '
-                               'Возможно, оно уже было удалено автоматически.'),
-                    status=404, mimetype='text/html'
-                )
-
             return Response(page_ok(action, quarantine_id),
                             status=200, mimetype='text/html')
 

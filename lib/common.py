@@ -187,9 +187,21 @@ def unuse_token(conn: sqlite3.Connection, token: str):
     conn.execute("DELETE FROM used_tokens WHERE token_hash=?", (h,))
     conn.commit()
 
-def cleanup_expired(conn: sqlite3.Connection):
+# Срок хранения записей в `notified` (дни).
+# ОБЯЗАН быть заметно больше, чем PMG `lifetime` в /etc/pmg/pmg.conf (сейчас 10).
+# Раньше чистка шла по token_expiry (= ttl_days = 10), что совпадало с lifetime:
+# запись «уже уведомляли» стиралась, пока письмо ещё лежало в карантине,
+# и нотифайер слал ПОВТОРНОЕ уведомление за часы до удаления письма
+# (pmg-daily, 05:00). Кнопки в таком письме гарантированно протухали → NOTFOUND.
+NOTIFIED_RETENTION_DAYS = 30
+
+def cleanup_expired(conn: sqlite3.Connection,
+                    notified_retention_days: int = NOTIFIED_RETENTION_DAYS):
     now = int(time.time())
-    conn.execute("DELETE FROM notified WHERE token_expiry < ?", (now,))
+    # Чистим по времени ОТПРАВКИ уведомления, а не по TTL токенов —
+    # чтобы retention не зависел от ttl_days и всегда перекрывал PMG lifetime.
+    conn.execute("DELETE FROM notified WHERE notified_at < ?",
+                 (now - notified_retention_days * 86400,))
     # Keep used_tokens for 30 days to prevent replay even after cleanup
     conn.execute("DELETE FROM used_tokens WHERE used_at < ?", (now - 30*86400,))
     conn.commit()
