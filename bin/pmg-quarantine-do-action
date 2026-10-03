@@ -23,6 +23,55 @@ use PMG::DBTools;
 use PMG::Quarantine;
 use PMG::Utils qw(try_decode_utf8);
 
+my $SPOOL_DIR   = '/var/spool/pmg';
+my $CONFIG_PATH = '/etc/pmg-quarantine-junk/config.ini';
+my $RSPAMC      = '/usr/bin/rspamc';
+
+# ---------------------------------------------------------------------------
+# Совместимость PMG 8 / PMG 9: в PMG 9 функция add_to_blackwhite переименована
+# в add_to_blockwelcome (смена терминологии, сигнатура и логика те же).
+# Выбираем ту, что есть, при старте — скрипт работает на обеих версиях.
+# ---------------------------------------------------------------------------
+
+my $add_to_list = PMG::Quarantine->can('add_to_blockwelcome')
+    // PMG::Quarantine->can('add_to_blackwhite')
+    // die "PMG::Quarantine: neither add_to_blockwelcome nor add_to_blackwhite found\n";
+
+# ---------------------------------------------------------------------------
+# Дообучение rspamd кнопками (опционально, [rspamd] learn = yes в config.ini).
+# В стандартном PMG rspamd нет, поэтому по умолчанию выключено.
+# ---------------------------------------------------------------------------
+
+sub rspamd_learn_enabled {
+    open(my $fh, '<', $CONFIG_PATH) or return 0;
+    my $section = '';
+    while (my $line = <$fh>) {
+        $line =~ s/[;#].*$//;
+        if ($line =~ /^\s*\[\s*([^\]]+?)\s*\]/) { $section = lc $1; next; }
+        next unless $section eq 'rspamd';
+        if ($line =~ /^\s*learn\s*[=:]\s*(\S+)/i) {
+            close $fh;
+            return lc($1) =~ /^(yes|true|on|1)$/ ? 1 : 0;
+        }
+    }
+    close $fh;
+    return 0;
+}
+
+my $RSPAMD_LEARN = rspamd_learn_enabled() && -x $RSPAMC;
+
+sub rspamd_learn {
+    my ($file_rel, $mode) = @_;  # mode: 'learn_ham' or 'learn_spam'
+    return unless $RSPAMD_LEARN && $file_rel;
+    # Запрещаем выход за пределы spool-каталога
+    return if $file_rel =~ m{\.\.};
+    # Untaint: допускаем только безопасные символы в пути
+    return unless $file_rel =~ m{^([a-zA-Z0-9/_.-]+)$};
+    my $path = "$SPOOL_DIR/$1";
+    return unless -f $path;
+    system($RSPAMC, $mode, $path);
+}
+
 # ---------------------------------------------------------------------------
 # Аргументы
 # ---------------------------------------------------------------------------
@@ -49,7 +98,7 @@ if (@ARGV == 3 && $ARGV[0] eq '--blacklist-sender') {
     my $bw_dbh = eval { PMG::DBTools::open_ruledb() };
     die "Cannot open PMG rule DB: $@\n" if $@;
 
-    eval { PMG::Quarantine::add_to_blackwhite($bw_dbh, $bw_pmail, 'BL', [$bw_sender]) };
+    eval { $add_to_list->($bw_dbh, $bw_pmail, 'BL', [$bw_sender]) };
     if ($@) {
         print "ERROR: $@\n";
         $bw_dbh->disconnect();
@@ -124,16 +173,19 @@ my $receiver = try_decode_utf8($ref->{receiver} // $ref->{pmail} // '');
 
 eval {
     if ($action eq 'whitelist') {
-        PMG::Quarantine::add_to_blackwhite($dbh, $pmail, 'WL', [$sender]);
+        rspamd_learn($ref->{file}, 'learn_ham');
+        $add_to_list->($dbh, $pmail, 'WL', [$sender]);
         PMG::Quarantine::deliver_quarantined_mail($dbh, $ref, $receiver);
         print "OK: sender '$sender' added to whitelist for '$pmail', mail delivered\n";
 
     } elsif ($action eq 'blacklist') {
-        PMG::Quarantine::add_to_blackwhite($dbh, $pmail, 'BL', [$sender]);
+        rspamd_learn($ref->{file}, 'learn_spam');
+        $add_to_list->($dbh, $pmail, 'BL', [$sender]);
         PMG::Quarantine::delete_quarantined_mail($dbh, $ref);
         print "OK: sender '$sender' added to blacklist for '$pmail', mail deleted\n";
 
     } elsif ($action eq 'deliver') {
+        rspamd_learn($ref->{file}, 'learn_ham');
         PMG::Quarantine::deliver_quarantined_mail($dbh, $ref, $receiver);
         print "OK: mail delivered to '$receiver'\n";
 

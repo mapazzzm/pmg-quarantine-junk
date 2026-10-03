@@ -17,8 +17,8 @@
 
 | Компонент | Версия |
 |-----------|--------|
-| Proxmox Mail Gateway | 7.x / 8.x |
-| Debian | 11 (Bullseye) / 12 (Bookworm) |
+| Proxmox Mail Gateway | 7.x / 8.x / 9.x |
+| Debian | 11 (Bullseye) / 12 (Bookworm) / 13 (Trixie) |
 | Python | 3.9+ (устанавливается автоматически) |
 | PostgreSQL | входит в стандартную установку PMG |
 
@@ -270,6 +270,37 @@ exclude_addresses = robot@example.com, noreply@example.com, shared@example.com
 Адреса перечисляются через запятую, регистр не важен. Оставьте поле пустым, чтобы отправлять уведомления всем.
 
 > **Важно:** исключённые письма **не** записываются в `state.db` как уведомлённые. Если позднее убрать адрес из списка — при следующем запуске notifier отправит накопившиеся уведомления.
+
+### Дообучение rspamd кнопками (опционально)
+
+Если PMG работает в связке с [rspamd](https://rspamd.com/), кнопки могут дополнительно дообучать его Bayes-классификатор:
+«Не спам» и «Доставить» → `rspamc learn_ham`, «Спам» → `rspamc learn_spam`.
+
+```ini
+[rspamd]
+learn = yes
+```
+
+Нужен `/usr/bin/rspamc`. `install.sh` включает опцию сам, если находит rspamc; в стандартном PMG rspamd нет, и по умолчанию она выключена.
+
+### Обновление ОС / PMG (например, PMG 8 → 9, Debian 12 → 13)
+
+Скрипты совместимы с PMG 7/8/9: различия API (в PMG 9 `add_to_blackwhite` переименована в `add_to_blockwelcome`) определяются при запуске.
+
+Но при смене мажорной версии Debian меняется Python (12 → 13: 3.11 → 3.13), и pip-пакеты прежней версии новый Python не видит — action-сервер и notifier перестанут запускаться. После обновления ОС выполните:
+
+```bash
+cd pmg-quarantine-junk && git pull
+bash install.sh --deps-only
+```
+
+Режим `--deps-only` ставит зависимости из `requirements.txt` для системного `python3`, ничего не спрашивает, не трогает конфиг и перезапускает action-сервер. Без доступа в интернет — заранее скачать колёса под новую версию Python и указать их каталог:
+
+```bash
+pip download -r requirements.txt --only-binary=:all: --python-version 3.13 \
+    --platform manylinux2014_x86_64 -d ./wheels
+PIP_NO_INDEX=1 PIP_FIND_LINKS=./wheels bash install.sh --deps-only
+```
 
 ---
 

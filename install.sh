@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  pmg-quarantine-junk — установочный скрипт
-#  Поддерживаемые дистрибутивы: Debian 11/12 (Proxmox Mail Gateway 7/8)
+#  Поддерживаемые дистрибутивы: Debian 11/12/13 (Proxmox Mail Gateway 7/8/9)
+#
+#  ./install.sh              — полная установка (интерактивно)
+#  ./install.sh --deps-only  — только Python-зависимости, без вопросов.
+#                              Запускать после обновления ОС (смена версии Python,
+#                              напр. Debian 12→13: pip-пакеты прежнего Python не видны).
+#                              Офлайн: PIP_NO_INDEX=1 PIP_FIND_LINKS=<каталог с .whl> ./install.sh --deps-only
 # =============================================================================
 set -euo pipefail
 
@@ -31,6 +37,13 @@ LOGROTATE_DIR=/etc/logrotate.d
 CRON_FILE=/etc/cron.d/pmg-quarantine-junk
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+DEPS_ONLY=0
+case "${1:-}" in
+    --deps-only) DEPS_ONLY=1 ;;
+    "") ;;
+    *) echo "Использование: $0 [--deps-only]" >&2; exit 1 ;;
+esac
 
 # ---------- Должны запускаться от root -------------------------------------
 [[ $EUID -eq 0 ]] || die "Запустите скрипт от root: sudo $0"
@@ -84,19 +97,21 @@ ok "PMG Perl-модули присутствуют"
 section "3. Проверка и установка Python 3"
 # =============================================================================
 
+# Только системный python3: скрипты запускаются через «#!/usr/bin/env python3»,
+# поэтому зависимости должны ставиться именно для него, а не для python3.X,
+# который может оказаться не системным (или исчезнуть при обновлении ОС).
 PYTHON=""
-for candidate in python3.11 python3.10 python3.9 python3; do
-    if command -v "$candidate" &>/dev/null; then
-        ver=$("$candidate" --version 2>&1 | awk '{print $2}')
-        major=$(echo "$ver" | cut -d. -f1)
-        minor=$(echo "$ver" | cut -d. -f2)
-        if [[ "$major" -ge 3 && "$minor" -ge 9 ]]; then
-            PYTHON="$candidate"
-            ok "Python найден: $PYTHON ($ver)"
-            break
-        fi
+if command -v python3 &>/dev/null; then
+    ver=$(python3 --version 2>&1 | awk '{print $2}')
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+    if [[ "$major" -ge 3 && "$minor" -ge 9 ]]; then
+        PYTHON=python3
+        ok "Python найден: $PYTHON ($ver)"
+    else
+        die "Нужен Python 3.9+, системный python3 — $ver"
     fi
-done
+fi
 
 if [[ -z "$PYTHON" ]]; then
     info "Python 3.9+ не найден, устанавливаем..."
@@ -140,20 +155,31 @@ ok "pip: $("$PYTHON" -m pip --version | awk '{print $1,$2}')"
 section "5. Установка Python-зависимостей"
 # =============================================================================
 
-REQUIRED_PKGS=(psycopg2-binary flask gunicorn "bleach>=6.2.0" tinycss2)
+REQUIREMENTS="$SCRIPT_DIR/requirements.txt"
+[[ -f "$REQUIREMENTS" ]] || die "Не найден $REQUIREMENTS"
 
-for pkg in "${REQUIRED_PKGS[@]}"; do
-    pkg_name="${pkg%%[>=<!]*}"  # bleach>=6.2.0 → bleach
-    pkg_name="${pkg_name%%-*}"  # psycopg2-binary → psycopg2
-    if "$PYTHON" -c "import ${pkg_name//-/_}" &>/dev/null 2>&1; then
-        ok "Python-пакет уже установлен: $pkg"
-    else
-        info "Устанавливаем Python-пакет: $pkg ..."
-        "$PYTHON" -m pip install "$pkg" --quiet --break-system-packages \
-            || "$PYTHON" -m pip install "$pkg" --quiet
-        ok "Установлен: $pkg"
+info "Устанавливаем зависимости из requirements.txt для $($PYTHON --version) ..."
+# --break-system-packages нужен на Debian 12+ (PEP 668); на Debian 11 pip его не знает
+"$PYTHON" -m pip install -r "$REQUIREMENTS" --quiet --break-system-packages \
+    || "$PYTHON" -m pip install -r "$REQUIREMENTS" --quiet \
+    || die "Не удалось установить Python-зависимости"
+
+"$PYTHON" -c "import psycopg2, flask, gunicorn, bleach, tinycss2" \
+    || die "Зависимости установлены, но не импортируются в $PYTHON"
+ok "Python-зависимости на месте"
+
+if [[ $DEPS_ONLY -eq 1 ]]; then
+    if systemctl is-enabled --quiet pmg-quarantine-action-server 2>/dev/null; then
+        systemctl restart pmg-quarantine-action-server
+        if systemctl is-active --quiet pmg-quarantine-action-server; then
+            ok "pmg-quarantine-action-server перезапущен"
+        else
+            die "pmg-quarantine-action-server не запустился: journalctl -u pmg-quarantine-action-server"
+        fi
     fi
-done
+    ok "Режим --deps-only: готово"
+    exit 0
+fi
 
 # =============================================================================
 section "6. Сбор параметров конфигурации"
@@ -348,6 +374,14 @@ if [[ -f "$CONFIG_FILE" ]]; then
     warn "Существующий конфиг сохранён как $BACKUP"
 fi
 
+# Дообучение rspamd кнопками — включаем, только если rspamd установлен
+if [[ -x /usr/bin/rspamc ]]; then
+    RSPAMD_LEARN=yes
+    ok "Найден rspamc — кнопки будут дообучать rspamd (Bayes)"
+else
+    RSPAMD_LEARN=no
+fi
+
 cat > "$CONFIG_FILE" <<EOF
 # pmg-quarantine-junk — автоматически сгенерирован install.sh
 # $(date)
@@ -386,6 +420,10 @@ password =
 mail_from      = ${MAIL_FROM}
 body_percent   = ${BODY_PERCENT}
 body_min_chars = ${BODY_MIN_CHARS}
+
+[rspamd]
+# Кнопки «Не спам»/«Спам» дообучают Bayes rspamd (rspamc learn_ham/learn_spam)
+learn = ${RSPAMD_LEARN}
 EOF
 
 chown root:pmg-quarantine "$CONFIG_FILE"

@@ -1,0 +1,8 @@
+# Python-зависимости pmg-quarantine-junk.
+# Ставит install.sh (полная установка или --deps-only после обновления ОС).
+psycopg2-binary>=2.9.9
+flask>=2.2
+# gunicorn < 22.0 уязвим к HTTP request smuggling (CVE-2024-1135); порт action-сервера смотрит в интернет
+gunicorn>=22.0
+bleach>=6.2.0
+tinycss2>=1.2
